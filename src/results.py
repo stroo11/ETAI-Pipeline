@@ -18,13 +18,23 @@ def save_run(results_dir: str, config: dict, report_text: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(results_dir, f"run_{timestamp}.txt")
 
+    prep, evaluation = config["preprocessing"], config["evaluation"]
+    if evaluation["method"] == "cv":
+        cv = config["cv"]
+        method = (f"cross-validation  n_splits={cv['n_splits']}  shuffle={cv.get('shuffle', True)}  "
+                  f"random_state={cv.get('random_state')}  scoring={cv.get('scoring', 'accuracy')}")
+    else:
+        method = (f"holdout  validation_size={evaluation['validation_size']}  "
+                  f"random_state={evaluation['random_state']}")
+
     header = (
         f"Run: {timestamp}\n"
-        f"Model: {config['model']['type']}  params={config['model']['params']}\n"
-        f"Preprocessing: encoder={config['preprocessing']['encoder']}  "
-        f"scaler={config['preprocessing']['scaler']}\n"
-        f"Test size: {config['split']['test_size']}  "
-        f"random_state: {config['split']['random_state']}\n"
+        f"Model: {config['model']['type']}  params={config['model'].get('params')}\n"
+        f"Preprocessing: encoder={prep['encoder']}  scaler={prep['scaler']}  "
+        f"numeric_imputer={prep.get('numeric_imputer', 'median')}  log_features={prep.get('log_features') or []}\n"
+        f"Evaluation: {method}  (development set only)\n"
+        f"Locked test set: size={config['test_set']['size']}  "
+        f"random_state={config['test_set']['random_state']}  -- not scored\n"
         + "=" * 60 + "\n\n"
     )
 

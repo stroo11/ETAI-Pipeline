@@ -1,10 +1,11 @@
 """
-Preprocessing -- week 3: from diagnosis to a deployable recipe.
+Preprocessing -- week 3: from diagnosis to a deployable recipe; week 4: row-preserving cleaning, a locked test set, and a configurable imputer.
 
-Raw data in, model-ready split out, in two stages:
+Raw data in, model-ready split out, in three kinds of step:
 
-1. `clean_dataset` -- deterministic cleanup driven by the EDA diagnosis in config.yaml (canonical categories, placeholder / domain-rule violations -> NaN, de-duplication, redundant columns dropped). Nothing here is learned from the data, so it is safe to run on the whole dataset before the split.
-2. `build_preprocessor` -- everything that IS learned (imputed medians/modes, encoder categories, scaler mean/std) lives in a ColumnTransformer that is fit on the training rows only, then applied unchanged to test / inference rows.
+1. `clean_dataset` -- stateless rules driven by the EDA diagnosis in config.yaml (canonical categories, placeholder / domain-rule violations -> NaN, redundant columns dropped). Nothing here is learned from the data, and since week 4 it is row-preserving (same rows, same order), so it runs unchanged on training data and on data to predict.
+2. `drop_duplicate_rows` -- a training-data-only decision (week 4): it removes rows, so it runs once on the labelled file, before the dev/test split, and never on data to predict.
+3. `build_preprocessor` -- everything that IS learned (imputed medians/neighbours, encoder statistics, scaler centre/spread) lives in a ColumnTransformer that is fit on the training rows of each split / CV fold only, then applied unchanged to validation, test and inference rows.
 
 None of these functions require the target column, so the same code runs on unlabeled data at inference time.
 
@@ -13,10 +14,11 @@ None of these functions require the target column, so the same code runs on unla
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.model_selection import train_test_split
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
+    FunctionTransformer,
     MinMaxScaler,
     OneHotEncoder,
     OrdinalEncoder,
@@ -88,6 +90,8 @@ def fix_age_cat(df: pd.DataFrame) -> pd.DataFrame:
 def clean_dataset(df: pd.DataFrame, cleaning: dict) -> pd.DataFrame:
     """
     Apply the EDA diagnosis (config.yaml -> preprocessing.cleaning). Target-agnostic and fit-free, so it is safe on the full dataset and on label-free inference data.
+
+    Row-preserving (week 4): every input row comes out, in the same order. Removing duplicates is a training-only decision and lives in `drop_duplicate_rows()` -- at prediction time every row needs a prediction.
     """
     out = df.copy()
     placeholder_tokens = set(cleaning["placeholder_tokens"])
@@ -102,14 +106,21 @@ def clean_dataset(df: pd.DataFrame, cleaning: dict) -> pd.DataFrame:
     out = recover_juv_fel_count(out)
     out = fix_age_cat(out)
 
-    # exact duplicates and repeated ids point at the same 72 rows -- keep the first occurrence
-    out = out.drop_duplicates()
-    if "id" in out.columns:
-        out = out.drop_duplicates(subset="id", keep="first")
-
     # redundant columns (multicollinearity), dropped only after they've been used above
     out = out.drop(columns=[c for c in cleaning["redundant_columns"] if c in out.columns])
 
+    return out
+
+
+def drop_duplicate_rows(df: pd.DataFrame, id_column: str = None) -> pd.DataFrame:
+    """
+    TRAINING DATA ONLY (week 4). Drops exact duplicate rows and repeated ids (keeping the first), so the same person can't be counted twice -- or land in both the development set and the locked test set. Must run BEFORE `split_dev_test()`.
+    Never call this on data you're predicting for: every row there needs a prediction.
+    """
+    # exact duplicates and repeated ids point at the same 72 rows
+    out = df.drop_duplicates()
+    if id_column and id_column in out.columns:
+        out = out.drop_duplicates(subset=id_column, keep="first")
     return out
 
 
@@ -141,8 +152,12 @@ def split_features_target(df: pd.DataFrame, target: str, sensitive_attr: str, dr
     return X, y, extras
 
 
-def split_train_test(X, y, extras, test_size: float, random_state: int):
-    """Stratified train/test split, keeping X, y and extras row-aligned -- week 2's original job."""
+def split_dev_test(X, y, extras, test_size: float, random_state: int):
+    """
+    Sets the final test set aside (week 4 -- replaces week 2/3's `split_train_test`). Stratified, with X, y and extras kept row-aligned.
+      - development set: everything we may learn from and compare models on. Holdout / cross-validation (src/evaluate.py) split it again into train and validation rows.
+      - locked test set: never used to fit, tune, compare or choose anything. Its size and seed live in config.yaml -> test_set and are not changed after week 4.
+    """
     return train_test_split(X, y, extras, test_size=test_size, random_state=random_state, stratify=y)
 
 
@@ -156,15 +171,48 @@ _SCALERS = {
 }
 
 _ENCODERS = {
-    "onehot": lambda: OneHotEncoder(handle_unknown="ignore", sparse_output=False),
-    "ordinal": lambda: OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
-    "target": lambda: TargetEncoder(random_state=0),  # unseen categories fall back to the target mean
+    "onehot": lambda seed: OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+    "ordinal": lambda seed: OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
+    # unseen categories fall back to the target mean; the internal cross-fitting keeps a row's own label out of its encoding
+    "target": lambda seed: TargetEncoder(target_type="binary", cv=StratifiedKFold(5, shuffle=True, random_state=seed)),
 }
+
+_NUMERIC_IMPUTERS = ["median", "mean", "knn"]
+
+
+def log1p_columns(X: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """log(1 + x) on the listed columns only (week 4). Changes the SHAPE of a skewed count -- something a scaler never does. NaN stays NaN, so imputation still sees the gap."""
+    out = X.copy()
+    for col in columns:
+        out[col] = np.log1p(out[col])
+    return out
+
+
+def build_numeric_pipeline(prep_config: dict) -> Pipeline:
+    """
+    Numeric block: [optional log1p] -> impute -> scale, or [optional log1p] -> scale -> KNN impute.
+    KNNImputer (week 4) fills a gap from the k most similar training rows, and "similar" is a distance -- so the columns must be on comparable scales BEFORE it runs (a raw age of 18-96 would otherwise drown out every count). sklearn's scalers ignore NaN when fitting and keep it when transforming, which is what makes scale-then-impute possible.
+    """
+    strategy = prep_config.get("numeric_imputer", "median")
+    if strategy not in _NUMERIC_IMPUTERS:
+        raise ValueError(f"Unknown numeric imputer: {strategy}. Options: {_NUMERIC_IMPUTERS}")
+    scaler = _SCALERS[prep_config["scaler"]]()
+    log_features = prep_config.get("log_features") or []
+
+    steps = []
+    if log_features:
+        steps.append(("log1p", FunctionTransformer(log1p_columns, kw_args={"columns": log_features},
+                                                   feature_names_out="one-to-one")))
+    if strategy == "knn":
+        steps += [("scale", scaler), ("impute", KNNImputer(n_neighbors=prep_config.get("knn_neighbors", 5)))]
+    else:
+        steps += [("impute", SimpleImputer(strategy=strategy)), ("scale", scaler)]
+    return Pipeline(steps)
 
 
 def build_preprocessor(prep_config: dict) -> ColumnTransformer:
     """
-    Leak-safe ColumnTransformer: every imputer / encoder / scaler inside it is fit on the training rows only when the surrounding Pipeline is fit.
+    Leak-safe ColumnTransformer: every imputer / encoder / scaler inside it is fit on the training rows only when the surrounding Pipeline is fit -- the training part of each CV fold, never the validation part.
     Every encoder tolerates categories it has never seen, so a new value at inference time doesn't crash the pipeline.
     """
     encoder_name, scaler_name = prep_config["encoder"], prep_config["scaler"]
@@ -173,13 +221,10 @@ def build_preprocessor(prep_config: dict) -> ColumnTransformer:
     if scaler_name not in _SCALERS:
         raise ValueError(f"Unknown scaler: {scaler_name}. Options: {list(_SCALERS)}")
 
-    numeric_pipeline = Pipeline([
-        ("impute", SimpleImputer(strategy="median")),
-        ("scale", _SCALERS[scaler_name]()),
-    ])
+    numeric_pipeline = build_numeric_pipeline(prep_config)
     categorical_pipeline = Pipeline([
         ("impute", SimpleImputer(strategy="most_frequent")),
-        ("encode", _ENCODERS[encoder_name]()),
+        ("encode", _ENCODERS[encoder_name](prep_config.get("random_state"))),
     ])
     indicator_columns = [f"{c}_was_missing" for c in mnar_columns(prep_config["imputation"])]
 

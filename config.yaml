@@ -6,6 +6,7 @@ data:
   target: "two_year_recid"
   sensitive_attr: "race"          # excluded from model features, used only to audit fairness
   drop_columns: ["id", "decile_score", "score_text"]  # identifiers / COMPAS's own score, not our model's inputs
+  id_column: "id"                 # week 4: repeated ids are dropped from the TRAINING data only (drop_duplicate_rows)
 
 preprocessing:
   # --- stage 1: deterministic cleanup (the EDA diagnosis), safe before the split
@@ -43,16 +44,43 @@ preprocessing:
   categorical_features: ["sex", "age_cat", "c_charge_degree"]
   encoder: "target"               # onehot | ordinal | target
   scaler: "minmax"                # none | standard | minmax | robust
+  numeric_imputer: "median"       # week 4: median | mean | knn (knn scales first, then imputes from the nearest rows)
+  knn_neighbors: 5                # only used when numeric_imputer = knn
+  log_features: []                # week 4: numeric columns to log1p before imputing/scaling, e.g. ["priors_count"]
+  random_state: 42                # seed for the target encoder's internal cross-fitting
 
-split:
-  test_size: 0.2
+# Week 4: the FINAL TEST SET. Carved out once, stratified, and locked: never used to fit,
+# tune, compare or choose anything. Do not change these two values again -- a new seed would
+# silently give a different (already partly "seen") test set. Replaces week 2/3's `split`.
+test_set:
+  size: 0.2
   random_state: 42
 
+# Week 4: how the development set (everything except the locked test set) is evaluated.
+evaluation:
+  method: "cv"                    # cv | holdout
+  validation_size: 0.25           # holdout only: share of the development set used for validation
+  random_state: 42                # holdout only
+
+cv:                               # same random_state = same folds on every run, for every model
+  n_splits: 5
+  shuffle: true
+  random_state: 42
+  scoring: "accuracy"             # one metric for now, so numbers compare directly with weeks 2-3
+  n_jobs: 1                       # folds fitted in parallel; -1 = all cores
+
+# Week 4: a regularised random forest -- min_samples_leaf=40 stops each tree from carving out tiny leaves that
+# memorise individual people. Chosen by 5x5 repeated CV and confirmed on fresh folds.
 model:
-  type: "decision_tree"   # or "logistic_regression"
+  type: "random_forest"           # dummy | logistic_regression | decision_tree | random_forest
   params:
-    max_depth: 5
+    n_estimators: 300
+    min_samples_leaf: 40
     random_state: 42
+    n_jobs: -1
+  # week 3's choice, still a close alternative (and easier to explain):
+  # type: "decision_tree"
+  # params: {max_depth: 5, random_state: 42}
 
 output:
   results_dir: "results"   # each run's full report is saved here as a timestamped .txt file
