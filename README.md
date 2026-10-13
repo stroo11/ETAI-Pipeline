@@ -11,6 +11,7 @@ Run it with `python main.py`. Everything tunable lives in `config.yaml`.
 | 2 | Baseline: drop missing rows, one-hot everything | one 80/20 split | Logistic regression, 0.680 (test) |
 | 3 | EDA-driven cleaning, imputation by missingness mechanism, leak-safe `Pipeline` | one 80/20 split (+ 15 repeated splits) | Decision tree, depth 5, 0.665 (test) |
 | 4 | Row-preserving cleaning, locked test set, cross-validation, dummy + random forest, configurable imputer (KNN) and log1p | stratified 5-fold CV on the development set | Random forest, `min_samples_leaf=40`, **0.683 ± 0.016** (CV) |
+| 5 | Hyperparameter tuning with Optuna (TPE) for the tree, logistic regression and random forest; `build_pipeline()`; search spaces in `config.yaml` | nested CV: 5 outer folds (same as week 4) × Optuna with 5 inner folds | Tuned random forest, **0.678 ± 0.012** (nested CV) |
 
 ## Week 2 -- Baseline
 
@@ -53,6 +54,16 @@ On fairness, the rate of people wrongly predicted to reoffend went down for ever
 - **New preprocessing options:** a KNN imputer (`numeric_imputer: knn`, which scales before imputing because KNN uses distances), mean imputation, and a `log1p` transform for skewed counts (`log_features`).
 - **A fair way to compare two recipes:** `paired_comparison()` scores both recipes on the same folds and uses a corrected t-test (Nadeau & Bengio), because CV folds share most of their training rows and a normal t-test is too confident.
 
+## Week 5 -- Hyperparameter tuning
+
+**What was done:**
+
+- **Tuning is part of the pipeline.** With `tuning.enabled: true`, `main.py` tunes the configured model with Optuna (`src/tuning.py`) and refits the tuned pipeline on all development rows. With `false`, it does exactly what it did in week 4.
+- **One place builds the estimator.** `build_pipeline()` (`src/model.py`) puts preprocessing and model into one `Pipeline`; CV, tuning and the final refit all use it. Its step names address hyperparameters from outside (`model__max_depth`, `prep__numeric__impute__strategy`).
+- **Search spaces live in `config.yaml`**, one per model (`tuning.search_spaces`): the tree (`max_depth`, `min_samples_leaf`, `criterion`), logistic regression (`C`, log scale from 0.0001 to 100) and the random forest (`n_estimators`, `max_depth` incl. `None`, `min_samples_leaf`, `max_features`).
+- **Nested cross-validation** (`nested_cross_validate()`) gives the honest score for "tune, then refit". Its out-of-fold predictions feed the classification report and the fairness audit. `tuning_report()` prints the top trials and the optimism check.
+- `main.run(config)` runs the whole pipeline for one config, so `wk05/run_challenges.py` reuses the exact `python main.py` code path for every challenge scenario (results in `wk05/challenge_results.json`).
+
 ## Model evaluation
 
 The test set is locked. Models are compared with stratified 5-fold cross-validation on the development set, and the same seed gives the same folds for every model.
@@ -88,4 +99,39 @@ The test set is locked. Models are compared with stratified 5-fold cross-validat
 
 **Fairness (out-of-fold, development set):** our models still make far fewer false accusations than COMPAS, which wrongly flags 45% of African-American and 23% of Caucasian defendants who did not reoffend, against 26% / 13% for logistic regression and 30% / 16% for the tuned forest. The gap between the two groups (about 0.13) is the same in every model and has not shrunk since week 3. The tuned forest predicts "reoffends" more often, so it catches more people who do reoffend (recall 0.569 vs 0.511), but its false positive rate is 1 to 4 points higher in every group. This is the cost of its higher accuracy, and the next step is to choose the decision threshold based on what each type of error costs.
 
-**Current best model:** a random forest with 300 trees and `min_samples_leaf=40`: **0.683 ± 0.016** CV accuracy, train–validation gap +0.005, and roughly 1 point better than the week 3 tree, confirmed on fresh folds. The depth-5 tree (0.674) and logistic regression (0.672) remain close, and they are simpler to explain.
+**Best model at the end of week 4:** a random forest with 300 trees and `min_samples_leaf=40`: **0.683 ± 0.016** CV accuracy, train–validation gap +0.005, and roughly 1 point better than the week 3 tree, confirmed on fresh folds. The depth-5 tree (0.674) and logistic regression (0.672) remain close, and they are simpler to explain.
+
+### Week 5 -- Hyperparameter tuning
+
+**How the pipeline tunes.** Optuna's TPE sampler (seeded with `tuning.random_state: 42`) proposes hyperparameters from the model's search space in `config.yaml`. Every trial clones the *whole* pipeline, sets the candidate values, and scores it with 5-fold CV on the development set (`tuning.n_splits: 5`). The inner folds are the same for every trial, so candidates are compared like-for-like. I ran 30 trials for the tree and logistic regression and 15 for the forest, with `n_estimators` kept between 50 and 300. **Why it doesn't leak:** the test set is still locked. The imputer, encoder and scaler are re-fit on the training part of every fold of every trial. And the score I report is not the best trial's score but **nested CV**: the tuning is repeated from scratch inside each of the 5 outer folds (the same folds as week 4), and the tuned model is scored on the outer-validation rows, which played no part in choosing it.
+
+| Model | Default: CV mean ± std | Tuned: nested CV mean ± std | Tuning score (best trial) | Optimism | Chosen hyperparameters |
+|---|---|---|---|---|---|
+| Decision tree | 0.614 ± 0.013 | 0.676 ± 0.019 | 0.680 | -0.001 | `max_depth=6`, `min_samples_leaf=110`, `criterion=entropy` |
+| Logistic regression | 0.672 ± 0.015 | 0.671 ± 0.013 | 0.674 | +0.001 | `C=4.55` |
+| **Random forest** | 0.646 ± 0.018 | **0.678 ± 0.012** | 0.681 | +0.004 | `n_estimators=128`, `max_depth=8`, `min_samples_leaf=36`, `max_features=0.5` |
+
+*Default = scikit-learn's defaults (LR with `max_iter=2000`). Optimism = mean tuning score inside the outer folds (`inner_best`) minus the mean nested CV score. Chosen hyperparameters = one tuning run on the whole development set.*
+
+The tree and the forest gained a lot from tuning: +6.2 and +3.2 points, which is 3 to 5 times the fold-to-fold std. Both gains come from the same thing. Without limits, the trees memorize the training rows (train–validation gap +0.08), and tuning regularizes them (gap ≈ +0.01). Logistic regression gained nothing (-0.001, well inside its ± 0.013), because it was never overfitting in the first place. Tuning changed the ranking: the tree went from worst to level with the others. But the three tuned models are now within 0.007 of each other, less than one std, so in practice they are tied. The forest is only nominally best. For the forest I would report **0.678 ± 0.012**, the nested CV score. It measures the whole procedure (tune with 15 trials, then refit) on rows that took no part in the choice. The best-trial score (0.681), and week 4's hand-picked 0.683, were both chosen as the maximum of several noisy scores, so they are slightly optimistic. Here the optimism is small (≤ 0.004) because the search spaces are small and 5 folds average out a lot of the noise.
+
+**Challenge 1 -- tuning logistic regression.** `C` searched on a log scale from 0.0001 to 100 barely matters. Every value from about 0.2 to 20 scores the same, and the five outer folds picked anything from `C=0.19` to `C=19` with identical results. A linear model with about 10 coefficients and about 4,600 training rows per fold has very little variance to remove. The default (`C=1`) is already in the flat region, so regularization has nothing left to fix. The tree has thousands of possible leaves, so its capacity, and with it its overfitting, depends almost entirely on its hyperparameters.
+
+**Challenge 2 -- tuning the random forest.** The forest prefers **deeper trees than the single tree** (`max_depth=8` vs 6, with three of the five outer folds also choosing 8). It also chose `min_samples_leaf=36`, almost exactly the 40 I picked by hand in week 4. That fits the bias–variance picture. A single tree has to stay shallow, because depth adds variance. A forest averages many decorrelated trees (`max_features=0.5`), which cancels much of that variance, so each tree can afford to be deeper and less biased. In both models the real brake is the minimum leaf size, not the depth.
+
+**Challenge 3 -- tuning the preprocessing too.** Adding `prep__numeric__impute__strategy: [median, mean]` to the tree's space: the tuner kept `median` (on the full development set and in 4 of 5 outer folds), and nested CV was 0.673 ± 0.012, inside the noise of the 0.676 above. This confirms week 4's finding that the imputer barely matters here. It is still **leak-free**, because the strategy is just another `Pipeline` parameter: the imputer is re-fit on the training part of each fold of each trial. It would **not** be valid with preprocessing cached once outside the trials. A cache stores folds that were already transformed with *one* strategy, so the "other" strategy would never really be tried. And fitting the preprocessing once on all development rows would let validation rows shape their own features (week 5 mistake 2).
+
+**Challenge 4 -- `cv.scoring: balanced_accuracy`** (out-of-fold, nested CV):
+
+| Model, tuned for | Chosen hyperparameters | Accuracy | Balanced acc. | Recall (reoffends) | FPR African-American | FPR Caucasian |
+|---|---|---|---|---|---|---|
+| Tree, accuracy | depth 6, leaf 110, entropy | 0.676 | 0.665 | 0.552 | 0.29 | 0.17 |
+| Tree, balanced acc. | depth 13, leaf 111, gini | 0.671 | 0.663 | 0.583 | 0.33 | 0.19 |
+| LR, accuracy | C = 4.55 | 0.671 | 0.656 | 0.502 | 0.26 | 0.13 |
+| LR, balanced acc. | C = 4.17 | 0.673 | 0.659 | 0.517 | 0.27 | 0.14 |
+| Forest, accuracy | 128 trees, depth 8, leaf 36, 0.5 | 0.678 | 0.667 | 0.559 | 0.30 | 0.16 |
+| Forest, balanced acc. | 203 trees, depth 20, leaf 35, sqrt | 0.679 | 0.669 | 0.568 | 0.30 | 0.17 |
+
+The chosen hyperparameters change for the tree (depth 6 → 13) and the forest (depth 8 → 20, `sqrt`), but hardly for LR. Recall of the positive class goes up a little in every model (+1.5 to +3 points), because the models predict "reoffends" more often. The price is paid in false positives, and it is paid in every group: the African-American FPR rises from 0.29 to 0.33 for the tree, and the gap to Caucasian defendants (about 0.13) does not shrink. The effect is small because the classes are only mildly imbalanced (45% reoffend) and the models still predict with a 0.5 threshold. Changing the metric changes which hyperparameters win, not the decision rule. Choosing the threshold, or `class_weight`, is the stronger lever here, and it should be chosen based on what each kind of error costs.
+
+**Current best model:** the tuned random forest (`n_estimators=128`, `max_depth=8`, `min_samples_leaf=36`, `max_features=0.5`), **0.678 ± 0.012** nested CV accuracy. It is tied with the tuned tree (0.676) and logistic regression (0.671). It is the model in `config.yaml`, and `python main.py` re-tunes and refits it.

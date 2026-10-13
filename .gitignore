@@ -5,3 +5,4 @@ __pycache__/
 .ipynb_checkpoints/
 *.egg-info/
 results/
+wk05/challenge_results.json

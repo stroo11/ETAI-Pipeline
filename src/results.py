@@ -1,7 +1,7 @@
 """
 Saving each run's results to disk.
 
-Printing to the terminal is fine while you're watching it happen, but it's gone the moment you scroll past it or close the window. This module writes the full report (accuracy, classification report, fairness table) to a timestamped file in `results/` instead, so youcan open it again later, or compare two runs side by side after changing something in config.yaml.
+Printing to the terminal is fine while you're watching it happen, but it's gone the moment you scroll past it or close the window. This module writes the full report (accuracy, classification report, fairness table) to a timestamped file in `results/` instead, so you can open it again later, or compare two runs side by side after changing something in config.yaml.
 """
 import os
 from datetime import datetime
@@ -27,18 +27,27 @@ def save_run(results_dir: str, config: dict, report_text: str) -> str:
         method = (f"holdout  validation_size={evaluation['validation_size']}  "
                   f"random_state={evaluation['random_state']}")
 
+    tuning = config.get("tuning", {})
+    if tuning.get("enabled", False):
+        tuning_line = (f"Tuning (week 5): Optuna TPE  n_trials={tuning['n_trials']}  inner n_splits={tuning['n_splits']}  "
+                       f"random_state={tuning['random_state']}  "
+                       f"search_space={(tuning.get('search_spaces') or {}).get(config['model']['type'])}\n")
+    else:
+        tuning_line = "Tuning (week 5): off\n"
+
     header = (
         f"Run: {timestamp}\n"
         f"Model: {config['model']['type']}  params={config['model'].get('params')}\n"
         f"Preprocessing: encoder={prep['encoder']}  scaler={prep['scaler']}  "
         f"numeric_imputer={prep.get('numeric_imputer', 'median')}  log_features={prep.get('log_features') or []}\n"
         f"Evaluation: {method}  (development set only)\n"
+        + tuning_line +
         f"Locked test set: size={config['test_set']['size']}  "
         f"random_state={config['test_set']['random_state']}  -- not scored\n"
         + "=" * 60 + "\n\n"
     )
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(header + report_text)
 
     return path
