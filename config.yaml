@@ -47,6 +47,10 @@ preprocessing:
   numeric_imputer: "median"       # week 4: median | mean | knn (knn scales first, then imputes from the nearest rows)
   knn_neighbors: 5                # only used when numeric_imputer = knn
   log_features: []                # week 4: numeric columns to log1p before imputing/scaling, e.g. ["priors_count"]
+  # Week 6: engineered columns (src/preprocessing.py:add_engineered_features), added to the numeric block.
+  # Fixed formulas, nothing learned -> computed before the split. Options:
+  # priors_per_adult_year | has_juvenile_record | young_x_priors | priors_bin
+  engineered_features: []
   random_state: 42                # seed for the target encoder's internal cross-fitting
 
 # Week 4: the FINAL TEST SET. Carved out once, stratified, and locked: never used to fit,
@@ -66,27 +70,35 @@ cv:                               # same random_state = same folds on every run,
   n_splits: 5
   shuffle: true
   random_state: 42
-  scoring: "accuracy"             # one metric for now, so numbers compare directly with weeks 2-3
+  # Week 7: every metric is reported for every run, from out-of-fold probabilities.
+  # fbeta_<beta> weights recall beta times as much as precision.
+  metrics: ["accuracy", "balanced_accuracy", "precision", "recall", "f1", "fbeta_2", "roc_auc", "average_precision"]
+  # One of metrics: what tuning maximises and runs are ranked by. ROC-AUC scores the RANKING of the risk
+  # probabilities over every threshold -- choosing the threshold is a separate decision (see README).
+  selection_metric: "roc_auc"
   n_jobs: -1                      # folds (and tuning trials' folds) fitted in parallel; -1 = all cores
 
-# Week 5: the model's DEFAULT hyperparameters. With tuning.enabled the search space below overrides the
-# tuned ones; the week-4 hand-picked forest (min_samples_leaf=40) is now chosen by the tuner instead.
+# The model main.py runs, with its DEFAULT hyperparameters. With tuning.enabled the search space below
+# overrides the tuned ones in every trial; the final model uses the best trial's values.
 model:
-  type: "random_forest"           # dummy | logistic_regression | decision_tree | random_forest
+  type: "gradient_boosting"       # dummy | logistic_regression | naive_bayes | decision_tree | random_forest | oblique_random_forest | adaboost | gradient_boosting | hist_gradient_boosting
   params:
     random_state: 42
-    n_jobs: 1                     # cv.n_jobs already parallelises the folds -- no nested parallelism
-  # other models, default hyperparameters (each has a search space below):
-  # type: "decision_tree"
-  # params: {random_state: 42}
-  # type: "logistic_regression"
-  # params: {max_iter: 2000}
+  # Other models' default params, to swap in (models keep n_jobs: 1 -- cv.n_jobs already parallelises the folds).
+  # class_weight: balanced would weight each class by 1 / its frequency (GradientBoosting and GaussianNB have none).
+  # logistic_regression:    {max_iter: 2000}
+  # naive_bayes:            {}
+  # decision_tree:          {random_state: 42}
+  # random_forest:          {n_estimators: 200, random_state: 42, n_jobs: 1}   # more trees never overfit: fixed, not tuned
+  # oblique_random_forest:  {n_estimators: 200, n_components: 10, random_state: 42, n_jobs: 1}
+  # adaboost:               {max_depth: 1, n_estimators: 200, learning_rate: 1.0, random_state: 42}
+  # hist_gradient_boosting: {random_state: 42}
 
 # Week 5: hyperparameter tuning with Optuna (src/tuning.py). Development set only; every trial is CV of the
 # WHOLE pipeline on the same inner folds; nested CV (outer = cv above) gives the honest number.
 tuning:
   enabled: true
-  n_trials: 15                    # forest: 15 (each trial ~100x slower than a tree); 30 for decision_tree / logistic_regression
+  n_trials: 30                    # ensembles take minutes per run: use a small n_trials (e.g. 5) while testing
   n_splits: 5                     # inner folds that score each candidate
   random_state: 42                # seeds the TPE sampler and the inner folds
   # Keys are Pipeline parameter names (step__param). Types: int / float (low, high, log) or categorical (choices).
@@ -95,15 +107,47 @@ tuning:
       model__max_depth: {type: int, low: 1, high: 20}
       model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
       model__criterion: {type: categorical, choices: ["gini", "entropy"]}
-      # challenge 3 -- tuning the preprocessing too (leak-free: re-fit inside every fold of every trial):
+      # week 5, challenge 3 -- tuning the preprocessing too (leak-free: re-fit inside every fold of every trial):
       # prep__numeric__impute__strategy: {type: categorical, choices: ["median", "mean"]}
-    logistic_regression:          # challenge 1: C = inverse regularisation strength, searched on a log scale
+    logistic_regression:          # C = inverse regularisation strength, searched on a log scale
       model__C: {type: float, low: 0.0001, high: 100, log: true}
-    random_forest:                # challenge 2: n_estimators kept modest so 15 trials stay affordable
-      model__n_estimators: {type: int, low: 50, high: 300}
-      model__max_depth: {type: categorical, choices: [null, 3, 5, 8, 12, 20]}
+    naive_bayes:                  # week 7: share of the largest feature variance added to every variance (smoothing)
+      model__var_smoothing: {type: float, low: 0.000000000001, high: 1.0, log: true}
+    random_forest:                # week 6: tree size and decorrelation; n_estimators fixed at 200 (more trees never overfit)
+      model__max_depth: {type: int, low: 2, high: 30}
       model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
-      model__max_features: {type: categorical, choices: ["sqrt", "log2", 0.5, 1.0]}
+      model__max_features: {type: categorical, choices: ["sqrt", 0.5, 1.0]}
+    oblique_random_forest:        # week 6: the same tree size, through the nested path; directions per tree <= 10 features
+      model__estimator__tree__max_depth: {type: int, low: 2, high: 30}
+      model__estimator__tree__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
+      model__estimator__project__n_components: {type: int, low: 3, high: 10}
+    adaboost:                     # week 6: how weak the base trees are; rounds and learning rate trade off
+      model__estimator__max_depth: {type: int, low: 1, high: 8}
+      model__n_estimators: {type: int, low: 25, high: 400, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 1.0, log: true}
+    gradient_boosting:            # week 7: trees, step size and tree size searched TOGETHER
+      model__n_estimators: {type: int, low: 25, high: 500, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.5, log: true}
+      model__max_depth: {type: int, low: 1, high: 6}
+      model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
+      model__subsample: {type: float, low: 0.5, high: 1.0}
+    hist_gradient_boosting:
+      model__max_iter: {type: int, low: 25, high: 500, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.5, log: true}
+      model__max_leaf_nodes: {type: int, low: 2, high: 63, log: true}
+      model__min_samples_leaf: {type: int, low: 5, high: 200, log: true}
+      model__l2_regularization: {type: float, low: 0.000001, high: 10.0, log: true}
+
+# Week 7 (Part B): learned feature selection as a Pipeline step between "prep" and "model" (src/selection.py).
+# Three models vote (random forest, gradient boosting, L1 logistic regression); a feature is kept with >= min_votes.
+feature_selection:
+  enabled: false
+  min_votes: 2
+  random_state: 42
+  search_space:                   # added to the model's search space when tuning is on
+    select__min_votes: {type: int, low: 1, high: 3}
 
 output:
-  results_dir: "results"   # each run's full report is saved here as a timestamped .txt file
+  results_dir: "results"          # each run's full report is saved here as run_<run id>.txt
+  scoreboard: "results/runs.csv"  # week 7: one row per run. Delete it when the data, cleaning or CV folds change --
+                                  # rows are only comparable (paired by fold) on the same rows and folds

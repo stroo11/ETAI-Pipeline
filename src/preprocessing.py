@@ -5,6 +5,7 @@ Raw data in, model-ready split out, in three kinds of step:
 
 1. `clean_dataset` -- stateless rules driven by the EDA diagnosis in config.yaml (canonical categories, placeholder / domain-rule violations -> NaN, redundant columns dropped). Nothing here is learned from the data, and since week 4 it is row-preserving (same rows, same order), so it runs unchanged on training data and on data to predict.
 2. `drop_duplicate_rows` -- a training-data-only decision (week 4): it removes rows, so it runs once on the labelled file, before the dev/test split, and never on data to predict.
+2b. `add_engineered_features` (week 6) -- fixed formulas (a rate, a flag, an interaction, fixed bins) chosen in config.yaml. Nothing is learned, so it runs before the split, like the missingness flags; a feature that needed a statistic of the data would have to be a Pipeline step instead.
 3. `build_preprocessor` -- everything that IS learned (imputed medians/neighbours, encoder statistics, scaler centre/spread) lives in a ColumnTransformer that is fit on the training rows of each split / CV fold only, then applied unchanged to validation, test and inference rows.
 
 None of these functions require the target column, so the same code runs on unlabeled data at inference time.
@@ -124,6 +125,47 @@ def drop_duplicate_rows(df: pd.DataFrame, id_column: str = None) -> pd.DataFrame
     return out
 
 
+# ------------------------------------------------- 1b. engineered features (week 6)
+
+def _priors_bin(df):
+    # fixed edges: 0 | 1 | 2-3 | 4-9 | 10+  ->  0..4 (NaN stays NaN)
+    return pd.cut(df["priors_count"], bins=[-np.inf, 0, 1, 3, 9, np.inf], labels=False)
+
+
+_ENGINEERED = {
+    # course example: a rate -- 2 priors at 19 is a different history from 2 priors at 45
+    "priors_per_adult_year": lambda df: df["priors_count"] / (df["age"] - 17).clip(lower=1),
+    # any juvenile offence at all (70% of them reoffend vs 41%); the three counts are almost always 0
+    "has_juvenile_record": lambda df: (df[["juv_fel_count", "juv_misd_count", "juv_other_count"]]
+                                       .sum(axis=1, min_count=3) > 0).astype(float)
+                                      .where(df[["juv_fel_count", "juv_misd_count", "juv_other_count"]].notna().all(axis=1)),
+    # interaction: priors only among the under-25s (a linear model can't multiply two features itself)
+    "young_x_priors": lambda df: (df["age"] < 25).astype(float).where(df["age"].notna()) * df["priors_count"],
+    # priors in fixed bins: a step function of priors, which a linear model can't build itself
+    "priors_bin": _priors_bin,
+}
+
+
+def add_engineered_features(df: pd.DataFrame, names: list) -> pd.DataFrame:
+    """
+    Week 6 (challenge 1): adds the listed engineered columns (config.yaml -> preprocessing.engineered_features).
+    Fixed formulas only -- nothing is learned from the data -- so this is safe before the split and on data to predict.
+    A missing input gives a missing feature, which is then imputed inside the Pipeline like any other gap.
+    """
+    unknown = [n for n in names if n not in _ENGINEERED]
+    if unknown:
+        raise ValueError(f"Unknown engineered feature(s): {unknown}. Options: {list(_ENGINEERED)}")
+    out = df.copy()
+    for name in names:
+        out[name] = _ENGINEERED[name](out)
+    return out
+
+
+def numeric_columns(prep_config: dict) -> list:
+    """The numeric block's columns: the configured numeric features plus any engineered ones."""
+    return prep_config["numeric_features"] + list(prep_config.get("engineered_features") or [])
+
+
 # ------------------------------------------------------- 2. features / target
 
 def mnar_columns(imputation: dict) -> list:
@@ -229,7 +271,7 @@ def build_preprocessor(prep_config: dict) -> ColumnTransformer:
     indicator_columns = [f"{c}_was_missing" for c in mnar_columns(prep_config["imputation"])]
 
     return ColumnTransformer([
-        ("numeric", numeric_pipeline, prep_config["numeric_features"]),
+        ("numeric", numeric_pipeline, numeric_columns(prep_config)),
         ("categorical", categorical_pipeline, prep_config["categorical_features"]),
         ("indicators", "passthrough", indicator_columns),
     ])

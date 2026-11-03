@@ -6,12 +6,14 @@ Run it with `python main.py`. Everything tunable lives in `config.yaml`.
 
 ## Pipeline progress
 
-| Week | What changed | How it is evaluated | Best model (accuracy) |
+| Week | What changed | How it is evaluated | Best model (score) |
 |---|---|---|---|
 | 2 | Baseline: drop missing rows, one-hot everything | one 80/20 split | Logistic regression, 0.680 (test) |
 | 3 | EDA-driven cleaning, imputation by missingness mechanism, leak-safe `Pipeline` | one 80/20 split (+ 15 repeated splits) | Decision tree, depth 5, 0.665 (test) |
 | 4 | Row-preserving cleaning, locked test set, cross-validation, dummy + random forest, configurable imputer (KNN) and log1p | stratified 5-fold CV on the development set | Random forest, `min_samples_leaf=40`, **0.683 ± 0.016** (CV) |
 | 5 | Hyperparameter tuning with Optuna (TPE) for the tree, logistic regression and random forest; `build_pipeline()`; search spaces in `config.yaml` | nested CV: 5 outer folds (same as week 4) × Optuna with 5 inner folds | Tuned random forest, **0.678 ± 0.012** (nested CV) |
+| 6 | Ensembles: oblique random forest and AdaBoost (`oblique_random_forest()`, `adaboost()`); random forest with fixed 200 trees; engineered features (`add_engineered_features()`, off by default) | nested CV (accuracy), same folds | Tuned AdaBoost, **0.684 ± 0.014** (nested CV), tied with both forests |
+| 7 | Gradient boosting, HistGradientBoosting and Naive Bayes; 8 metrics from out-of-fold probabilities, ROC-AUC as the selection metric; the scoreboard (`results/runs.csv`); optional learned feature selection (`VoteSelector`) | nested CV, **ROC-AUC**, same folds | Tuned HistGradientBoosting / gradient boosting, **0.728 ± 0.016** ROC-AUC (nested CV), tied with AdaBoost and the oblique forest |
 
 ## Week 2 -- Baseline
 
@@ -63,6 +65,26 @@ On fairness, the rate of people wrongly predicted to reoffend went down for ever
 - **Search spaces live in `config.yaml`**, one per model (`tuning.search_spaces`): the tree (`max_depth`, `min_samples_leaf`, `criterion`), logistic regression (`C`, log scale from 0.0001 to 100) and the random forest (`n_estimators`, `max_depth` incl. `None`, `min_samples_leaf`, `max_features`).
 - **Nested cross-validation** (`nested_cross_validate()`) gives the honest score for "tune, then refit". Its out-of-fold predictions feed the classification report and the fairness audit. `tuning_report()` prints the top trials and the optimism check.
 - `main.run(config)` runs the whole pipeline for one config, so `wk05/run_challenges.py` reuses the exact `python main.py` code path for every challenge scenario (it writes the numbers to `wk05/challenge_results.json`, a generated file that is git-ignored).
+
+## Week 6 -- Ensembles: random forest, oblique random forest and AdaBoost
+
+**What was done:**
+
+- **Two new model types** in `src/model.py`. `oblique_random_forest()` builds a forest whose splits are random linear combinations of features (a `SparseRandomProjection` followed by a decision tree, bagged). `adaboost()` is AdaBoost over decision trees of a chosen depth. Both are registered in `_MODELS`, so `model.type` can name them. They are functions rather than classes, because the base tree is an object and `config.yaml` can only hold plain values.
+- **Search spaces in `config.yaml`** follow from how each ensemble overfits. The random forest keeps `n_estimators` fixed at 200 (more trees never overfit, they only cost time) and tunes tree size and decorrelation (`max_depth`, `min_samples_leaf`, `max_features`). The oblique forest tunes the same tree size through the nested path `model__estimator__tree__...`, plus `n_components`. AdaBoost tunes how weak its base trees are (`model__estimator__max_depth`) together with `n_estimators` and `learning_rate`, because those two trade off.
+- **Feature engineering** (`add_engineered_features()` in `src/preprocessing.py`, switched on with `preprocessing.engineered_features`). It offers the course's `priors_per_adult_year` and three features of my own (challenge 1 below). All four are fixed formulas, so they are computed before the split and join the numeric block.
+- `wk06/run_challenges.py` runs every scenario through `main.run()` (results in the git-ignored `wk06/challenge_results.json`).
+
+## Week 7 -- Boosting, metrics from probabilities, and the scoreboard
+
+**What was done:**
+
+- **Three new model types** in `_MODELS`: `gradient_boosting` (`GradientBoostingClassifier`: regression trees fit to the gradient of the log-loss, summed in log-odds), `hist_gradient_boosting` (the same algorithm on binned features: faster, with native missing values), and `naive_bayes` (`GaussianNB`, a fast probabilistic baseline). Each has a search space in `config.yaml`. For the boosters, the number of trees, the learning rate and the tree size are searched **together**, because in boosting more trees *can* overfit. Gradient boosting is now the configured model.
+- **Several metrics, from probabilities.** `cross_validate_pipeline()` now returns out-of-fold **probabilities** instead of labels and scores every metric in `cv.metrics` (accuracy, balanced accuracy, precision, recall, F1, F2, ROC-AUC, average precision). `build_scorers()` builds the scorers, including `fbeta_<beta>`. The classification report (now with a confusion matrix) and the fairness check take the probabilities plus a threshold (0.5), so the threshold stays a separate, visible decision.
+- **One selection metric** (`cv.selection_metric: roc_auc`) is what Optuna maximizes and what runs are ranked by. `tune_pipeline()` takes its scorer, and `nested_cross_validate()` scores every metric on each outer fold.
+- **The scoreboard.** Every run adds one row to `results/runs.csv` (`save_scores()`): model, settings, engineered features, selection on/off, the selection metric's mean, std and per-fold scores, the **untuned** score of the same model and the **no-model floor** (a dummy on the same folds). `main.py` prints the board, best first, for runs on the same data and metric. Rows are paired by fold, so any two can be compared with `corrected_paired_test()`, which replaces week 4's `paired_comparison()` (same Nadeau & Bengio test, with the course's interface).
+- **Learned feature selection (Part B)** is an optional `"select"` step between `"prep"` and `"model"` (`src/selection.py`, `config.yaml` → `feature_selection`). A random forest, gradient boosting and an L1 logistic regression vote, and a feature is kept with at least `min_votes` votes. `select__min_votes` is tuned with the model. I found one edge case and handled it: with `min_votes=3` it could keep **zero** features (the L1 model zeroes everything) and crash the model. It now keeps the most-voted features instead.
+- `wk07/run_scoreboard.py` runs every model through `main.run()`, tuned where it has a search space (results also in the git-ignored `wk07/scoreboard_results.json`).
 
 ## Model evaluation
 
@@ -135,3 +157,59 @@ The tree and the forest gained a lot from tuning: +6.2 and +3.2 points, about 3 
 The chosen hyperparameters change for the tree (depth 6 → 13) and the forest (depth 8 → 20, `sqrt`), but hardly for LR. Recall of the positive class goes up a little in every model (+0.8 points for the forest, +1.5 for LR, +3.1 for the tree), because the models predict "reoffends" more often. The price is paid in false positives, and it is paid in every group: the African-American FPR rises from 0.29 to 0.33 for the tree, and the gap to Caucasian defendants (about 0.13) does not shrink. The effect is small because the classes are only mildly imbalanced (45% reoffend) and the models still predict with a 0.5 threshold. Changing the metric changes which hyperparameters win, not the decision rule. Choosing the threshold, or `class_weight`, is the stronger lever here, and it should be chosen based on what each kind of error costs.
 
 **Current best model:** the tuned random forest (`n_estimators=128`, `max_depth=8`, `min_samples_leaf=36`, `max_features=0.5`), **0.678 ± 0.012** nested CV accuracy. It is tied with the tuned tree (0.676) and logistic regression (0.671). It is the model in `config.yaml`, and `python main.py` re-tunes and refits it.
+
+### Week 6 -- Ensembles
+
+Accuracy, nested CV, the same 5 outer folds as every week (30 Optuna trials, 5 inner folds). Gap = train − validation accuracy.
+
+| Model | Default: CV mean ± std (gap) | Tuned: nested CV mean ± std (gap) | Tuning score (best trial) | Chosen hyperparameters |
+|---|---|---|---|---|
+| Logistic regression | 0.672 ± 0.015 (+0.001) | 0.671 ± 0.013 (+0.002) | 0.674 | `C=4.55` |
+| Decision tree | 0.614 ± 0.013 (+0.082) | 0.676 ± 0.019 (+0.009) | 0.680 | `max_depth=6`, `min_samples_leaf=110`, `criterion=entropy` |
+| Random forest | 0.646 ± 0.018 (+0.086) | 0.681 ± 0.015 (+0.008) | 0.684 | `max_depth=24`, `min_samples_leaf=45`, `max_features=0.5` (200 trees) |
+| Oblique random forest | 0.647 ± 0.016 (+0.110) | 0.680 ± 0.012 (+0.010) | 0.681 | tree `max_depth=15`, `min_samples_leaf=55`, `n_components=4` (200 trees) |
+| **AdaBoost** | 0.676 ± 0.013 (+0.006) | **0.684 ± 0.014 (+0.004)** | 0.683 | base tree `max_depth=4`, `n_estimators=220`, `learning_rate=0.025` |
+
+AdaBoost has the best mean, but its lead is not real. It is +0.003 over the random forest (4 of 5 folds, corrected p = 0.47), +0.004 over the oblique forest (p = 0.54) and +0.013 over logistic regression (5 of 5 folds, but p = 0.19). Every lead is smaller than the fold-to-fold std (≈ 0.014). The tuned ensembles are tied, and they are only about one point above logistic regression. The chosen hyperparameters do match how each model works. Both forests pick **deep** trees (24 and 15) braked by **large leaves** (45 and 55 people): averaging removes variance, so the trees can be complex, but not so complex that they memorize individuals (week 5 found the same leaf size). AdaBoost picks **weak** learners, trees of depth 4 with a small `learning_rate` and many rounds, because boosting reduces bias step by step and a strong base tree leaves it only noise to fit. Tuning helped most where the defaults overfit: the fully grown forests went from gaps of +0.09 and +0.11 to about +0.01. AdaBoost with stumps was already well behaved. I would choose AdaBoost and report **0.684 ± 0.014** (nested CV, accuracy), with the caveat that the random forest (0.681) and the oblique forest (0.680) are statistically indistinguishable from it. *(The week 5 forest scored 0.678 with a different search space; this week `n_estimators` is fixed at 200 and `max_depth` is an integer from 2 to 30.)* The oblique forest gains nothing over the ordinary one (+0.001 the other way, p = 0.92). COMPAS's signal is mostly "more priors, younger", which one-feature splits already express well, so slanted splits have little to add.
+
+**Challenge 1 -- feature engineering.** Besides the course's `priors_per_adult_year` (priors / years since 18), I added three features. `has_juvenile_record` is 1 if any juvenile count is above 0 (70% of those people reoffend, against 41% of the rest). `young_x_priors` is `priors_count` for people under 25 and 0 otherwise, an interaction. `priors_bin` puts priors into the fixed bins 0 | 1 | 2–3 | 4–9 | 10+. **None of them needs anything learned from the data**: they are fixed formulas with fixed constants, so they can be computed before the split and on new data. A missing input gives a missing feature, which the pipeline's imputer then fills inside each fold. A bin edge such as "the median of priors" would be learned, and would have to become a `Pipeline` step. (To be transparent: I chose the round bin edges after looking at reoffending rates by priors in the development set. That is a human choice informed by the data, so it is not perfectly blind, but the test set was never involved.)
+
+| Model, nested CV (accuracy) | Without | With the 4 features | Difference (folds won, corrected p) | ROC-AUC without → with |
+|---|---|---|---|---|
+| Logistic regression | 0.671 ± 0.013 | 0.677 ± 0.014 | +0.006 (3/5, p = 0.47) | 0.717 → 0.723 |
+| Random forest | 0.681 ± 0.015 | 0.673 ± 0.006 | −0.008 (1/5, p = 0.33) | 0.727 → 0.726 |
+| AdaBoost | 0.684 ± 0.014 | 0.676 ± 0.011 | −0.007 (1/5, p = 0.25) | 0.728 → 0.725 |
+
+Only the **linear model** gains, and by less than the fold std. That makes sense: logistic regression cannot divide, multiply or bin features on its own, so handing it a rate, an interaction and a step function gives it shapes it could not build. With the extra, correlated columns its tuner also chose stronger regularization (`C` 4.5 → 0.39). The tree ensembles already approximate these combinations with splits on `age` and `priors_count`, and they lose a little: four near-duplicates of `priors_count` crowd the random feature subsets at each split. The features stay **off** in `config.yaml` (`engineered_features: []`). They can be switched on per run.
+
+**Challenge 2 -- boosting a model that isn't a tree.** `AdaBoostClassifier(estimator=LogisticRegression(max_iter=2000))` is **worse** than one logistic regression on the same folds: accuracy 0.652 ± 0.016 against 0.672, and ROC-AUC 0.702 against 0.717. With 200 rounds and `learning_rate=0.1` it scores 0.658 and 0.702. With the default 50 rounds it kept only 21: scikit-learn stops boosting once a weighted learner is no better than chance. And the result is **not linear**. A weighted sum of linear *scores* would still be linear, so boosting could add nothing. But AdaBoost (SAMME) sums each learner's *vote* (±1), not its score, so the ensemble is a weighted vote of half-planes, a piecewise-constant function. Its out-of-fold probabilities take only 158 distinct values, against 3,755 for the single logistic regression. That staircase throws away the fine ranking a logistic regression gives (hence the lower ROC-AUC), and the re-weighting keeps pushing new learners towards noisy rows that a linear boundary cannot separate anyway. Boosting pays off with weak, flexible learners (shallow trees), not with a stable linear model.
+
+### Week 7 -- Scoreboard (ROC-AUC)
+
+**Selection metric: ROC-AUC.** This model produces a **risk score**, like COMPAS's own decile score, and what matters first is whether it **ranks** people who reoffend above people who don't. ROC-AUC measures exactly that ranking over every threshold, so it does not prejudge the separate decision of where to cut. Each cut-off trades false accusations against missed reoffenders, and the fairness check shows that the trade-off falls unevenly on different groups. Accuracy only counts which side of 0.5 each person lands on: it is noisier from fold to fold, and it rewards a model for matching the 0.5 cut, not for ranking well.
+
+Every model, tuned where it has a search space (30 Optuna trials, 5 inner folds), on the same 5 outer folds. **Untuned** = the same model with its `config.yaml` params, **floor** = the dummy (0.500 on every fold). Accuracy and recall come from the nested out-of-fold probabilities at threshold 0.5.
+
+| Model | Untuned: CV ROC-AUC | Tuned: nested CV ROC-AUC (gap) | Best trial | Accuracy | Recall | Chosen hyperparameters |
+|---|---|---|---|---|---|---|
+| Dummy (floor) | 0.500 ± 0.000 | — | — | — | — | — |
+| Naive Bayes | 0.685 ± 0.011 | 0.696 ± 0.011 (+0.001) | 0.696 | 0.606 | 0.202 | `var_smoothing=0.49` |
+| Logistic regression | 0.717 ± 0.014 | 0.718 ± 0.014 (+0.002) | 0.718 | 0.673 | 0.521 | `C=28.8` |
+| Decision tree | 0.614 ± 0.018 | 0.720 ± 0.015 (+0.013) | 0.719 | 0.675 | 0.575 | `max_depth=11`, `min_samples_leaf=120`, `gini` |
+| Random forest | 0.684 ± 0.019 | 0.725 ± 0.016 (+0.020) | 0.728 | 0.679 | 0.558 | `max_depth=15`, `min_samples_leaf=36`, `max_features=0.5` |
+| Oblique random forest | 0.688 ± 0.018 | 0.727 ± 0.015 (+0.018) | 0.728 | 0.679 | 0.553 | tree `max_depth=28`, `min_samples_leaf=61`, `n_components=8` |
+| AdaBoost | 0.723 ± 0.016 | 0.727 ± 0.014 (+0.014) | 0.729 | 0.683 | 0.561 | base `max_depth=4`, `n_estimators=55`, `learning_rate=0.17` |
+| **Gradient boosting** | 0.728 ± 0.015 | **0.728 ± 0.016** (+0.012) | 0.730 | 0.683 | 0.566 | `n_estimators=190`, `learning_rate=0.016`, `max_depth=4`, `min_samples_leaf=76`, `subsample=0.60` |
+| **HistGradientBoosting** | 0.719 ± 0.019 | **0.728 ± 0.016** (+0.011) | 0.730 | 0.685 | 0.568 | `max_iter=452`, `learning_rate=0.020`, `max_leaf_nodes=4`, `min_samples_leaf=24`, `l2_regularization=0.0007` |
+| Gradient boosting + feature selection | 0.723 ± 0.011 | 0.726 ± 0.013 (+0.005) | 0.726 | 0.679 | 0.557 | `max_depth=2`, 394 trees, `learning_rate=0.013`, `min_votes=1` |
+| Logistic regression + feature selection | 0.716 ± 0.011 | 0.716 ± 0.012 (+0.001) | 0.716 | 0.674 | 0.503 | `C=65`, `min_votes=1` |
+
+**What the corrected paired t-test can separate** (best mean, HistGradientBoosting, against each model, same 5 folds). The **top four are tied**: gradient boosting (+0.0001, p = 0.88), AdaBoost (+0.0007, p = 0.74) and the oblique forest (+0.0005, p = 0.85). But the boosters are **really better** than the random forest (+0.003, 5 of 5 folds, p = 0.006), the tuned tree (+0.008, p = 0.03), logistic regression (+0.010, p = 0.047) and Naive Bayes (+0.032, p = 0.006). The random forest result shows why ROC-AUC is the better selection metric: a gap of only 0.003 is detectable because it appears in every fold, while in week 6 a lead of the same size on accuracy (AdaBoost over the random forest, +0.003, p = 0.47) could not be told apart from noise. Week 6's "everything ties at 0.68" was partly the noise of accuracy.
+
+**Reading the scoreboard.** Every model is far above the floor, but the ceiling is low: the best ROC-AUC is 0.728, against 0.718 for a plain logistic regression. The remaining signal in these 10 features is small, so more model gains about one point. **Tuning mattered for the models that overfit by default** (tree +0.106, forests +0.04), and hardly at all for the boosters and logistic regression: gradient boosting's defaults (100 depth-3 trees, `learning_rate=0.1`) are already a good setting here. Both boosters chose **small trees and small steps** (depth 4 / 4 leaves, learning rates around 0.02, hundreds of trees), which is the week 7 recipe against boosting's overfitting. Naive Bayes ranks reasonably (0.696), but at 0.5 it flags almost nobody (recall 0.20). A likely reason: it assumes features are independent given the class, so correlated features such as `age` and `age_cat` are counted twice, which pushes its probabilities to the extremes and moves the 0.5 cut-off. The same trait gives it a misleadingly low false positive rate (0.09 / 0.04 for African-American / Caucasian defendants), because it simply flags few people.
+
+**Fairness (nested out-of-fold, threshold 0.5).** For the tied top models, the false positive rate is 0.29–0.30 for African-American defendants and 0.15–0.16 for Caucasian defendants, the same gap of about 0.14 as every week since week 3. COMPAS's own score gives 0.45 / 0.23 on the same rows. Better ranking did not narrow the gap. Closing it would need a decision about thresholds, not a better model.
+
+**Part B1 -- feature selection.** `VoteSelector` was tuned with the model (`select__min_votes` from 1 to 3) and compared on nested scores with `corrected_paired_test()`. It helped **neither** model: gradient boosting 0.726 vs 0.728 (−0.002, 1 of 5 folds, p = 0.34), logistic regression 0.716 vs 0.718 (−0.002, p = 0.57). The tuner chose `min_votes=1` on the whole development set (keep every feature with at least one vote), and the outer folds went both ways (1, 2 or 3), with no consistent effect on the score. With only 10 features after preprocessing there is little to remove, and the leak-free version is expensive, because the three voters are refit in every fold of every trial (about 5–9 minutes per run here). It stays **off** (`feature_selection.enabled: false`). On a dataset with hundreds of features the same step would matter much more.
+
+**Current best model:** tuned gradient boosting, the model in `config.yaml`, **0.728 ± 0.016** ROC-AUC (nested CV). It is tied with HistGradientBoosting (0.728, faster), AdaBoost (0.727) and the oblique forest (0.727), and it is significantly better than the random forest, the tree, logistic regression and Naive Bayes. This is the number I would report, with the tie stated. If speed mattered, I would pick HistGradientBoosting at no cost in score.
