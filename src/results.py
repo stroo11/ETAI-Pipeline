@@ -47,8 +47,11 @@ def save_run(results_dir: str, run: str, config: dict, report_text: str) -> str:
     else:
         tuning_line = "Tuning: off\n"
     selection = config.get("feature_selection") or {}
-    selection_line = (f"Feature selection: VoteSelector  min_votes={selection.get('min_votes', 2)}\n"
-                      if selection.get("enabled", False) else "Feature selection: off\n")
+    if selection.get("enabled", False):
+        settings = {key: value for key, value in selection.items() if key not in {"enabled", "search_space"}}
+        selection_line = f"Feature selection: on  {settings}\n"
+    else:
+        selection_line = "Feature selection: off\n"
 
     header = (
         f"Run: {run}   (written {datetime.now():%Y-%m-%d %H:%M:%S})\n"

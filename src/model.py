@@ -12,9 +12,10 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.pipeline import Pipeline
 from sklearn.random_projection import SparseRandomProjection
 from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
 
 from src.preprocessing import build_preprocessor
-from src.selection import VoteSelector
+from src.selection import VoteSelector, build_selector  # noqa: F401
 
 
 def oblique_random_forest(n_estimators: int = 100, n_components: int = 10, density="auto",
@@ -58,6 +59,8 @@ _MODELS = {
     # week 7: regression trees fit to the gradient of the log-loss, summed in log-odds; the binned (fast) version
     "gradient_boosting": GradientBoostingClassifier,
     "hist_gradient_boosting": HistGradientBoostingClassifier,
+    # week 8: gradient boosting with brakes inside every split (gamma, reg_alpha, reg_lambda, min_child_weight)
+    "xgboost": XGBClassifier,
 }
 
 
@@ -71,17 +74,18 @@ def build_model(model_config: dict):
     return _MODELS[model_type](**params)
 
 
-def build_pipeline(preprocessing_config: dict, model_config: dict, selection_config: dict = None) -> Pipeline:
+def build_pipeline(preprocessing_config: dict, model_config: dict, selection_config: dict = None,
+                   memory=None) -> Pipeline:
     """
-    The estimator that is cross-validated, tuned and refit: preprocessing and model as one
-    Pipeline, so every learned step is re-fit on the training part of each fold. Step names
-    address hyperparameters from outside (`model__max_depth`, `prep__numeric__impute__strategy`).
-    Any new learned step belongs here, between "prep" and "model" -- week 7: the optional
-    feature-selection step "select" (config.yaml -> feature_selection), tuned as `select__min_votes`.
+    The estimator that is cross-validated, tuned and refit: preprocessing, feature selection
+    (if `selection_config["enabled"]`) and model as one Pipeline, so every learned step is
+    re-fit on the training part of each fold. Step names address hyperparameters from outside
+    (`model__max_depth`, `select__min_votes`). `memory` (a folder) caches the fitted
+    preprocessing and selection steps: a fit on the same rows with the same settings is
+    reused instead of repeated, so tuning the model doesn't refit them in every trial.
     """
     steps = [("prep", build_preprocessor(preprocessing_config))]
     if selection_config and selection_config.get("enabled", False):
-        steps.append(("select", VoteSelector(min_votes=selection_config.get("min_votes", 2),
-                                             random_state=selection_config.get("random_state"))))
+        steps.append(("select", build_selector(selection_config)))
     steps.append(("model", build_model(model_config)))
-    return Pipeline(steps)
+    return Pipeline(steps, memory=memory)

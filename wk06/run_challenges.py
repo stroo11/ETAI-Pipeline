@@ -47,6 +47,7 @@ def scenario(base: dict, model_type: str, features: list = None) -> dict:
     config["model"] = {"type": model_type, "params": DEFAULT_PARAMS[model_type]}
     config["cv"]["selection_metric"] = "accuracy"
     config["preprocessing"]["engineered_features"] = features or []
+    config["feature_selection"]["enabled"] = False
     config["output"]["scoreboard"] = "results/runs_week6_accuracy.csv"
     return config
 

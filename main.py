@@ -9,7 +9,11 @@ This orchestrates the full pipeline:
     -> lock the test set away -> evaluate the whole pipeline on the development set (holdout or stratified k-fold CV, per config.yaml -> evaluation.method)
     -> [week 5, if tuning.enabled] nested CV of the tuning procedure, then tune on all development rows
     -> refit the final (tuned) model on all development rows -> save the report and [week 7] add the run to the scoreboard
+
+[week 8] Preprocessing and feature selection are cached in a temporary folder for the length of the run, so tuning the model doesn't refit them in every trial.
 """
+import shutil
+import tempfile
 from datetime import datetime
 
 import yaml
@@ -35,6 +39,7 @@ from src.evaluate import (
 )
 from src.tuning import nested_cross_validate, tune_pipeline, tuning_report
 from src.results import save_run, save_scores
+from src.selection import kept_features
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -68,6 +73,16 @@ def load_development_set(config: dict):
 
 
 def run(config: dict):
+    """Runs the pipeline for one config, with a cache folder of its own that is deleted afterwards (see `_run`)."""
+    # a new folder per run: a run can never reuse fits stored by an older run, with older data or code
+    cache_dir = tempfile.mkdtemp(prefix="pipeline_cache_")
+    try:
+        return _run(config, cache_dir)
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def _run(config: dict, cache_dir: str):
     """
     Runs the whole pipeline for one config, saves the report and adds the run to the scoreboard.
     Returns (final_model, summary), where summary holds the numbers behind the report (fold tables,
@@ -79,8 +94,12 @@ def run(config: dict):
     model_type = config["model"]["type"]
     X_dev, y_dev, extras_dev = load_development_set(config)
 
+    selection_cfg = config.get("feature_selection") or {}
+    selection_on = selection_cfg.get("enabled", False)
+    selection_method = selection_cfg.get("method", "vote")
+
     def make_pipeline(model_config):
-        return build_pipeline(prep_cfg, model_config, config.get("feature_selection"))
+        return build_pipeline(prep_cfg, model_config, selection_cfg, memory=cache_dir)
 
     pipeline = make_pipeline(config["model"])
     summary = {"run": run_id}
@@ -137,9 +156,8 @@ def run(config: dict):
             raise ValueError(f"tuning.enabled is true but config.yaml -> tuning.search_spaces has no entry for "
                              f"'{model_type}'. Add one, or set tuning.enabled: false.")
         search_space = dict(search_spaces[model_type])
-        selection_cfg = config.get("feature_selection") or {}
-        if selection_cfg.get("enabled", False) and selection_cfg.get("search_space"):
-            search_space.update(selection_cfg["search_space"])    # week 7: tune select__min_votes with the model
+        if selection_on:      # tune how much to select together with the model, e.g. select__min_votes
+            search_space.update((selection_cfg.get("search_space") or {}).get(selection_method) or {})
         n_trials = tuning_config["n_trials"]
         tuning_seed = tuning_config["random_state"]
         inner_cv = StratifiedKFold(n_splits=tuning_config["n_splits"], shuffle=True, random_state=tuning_seed)
@@ -175,14 +193,16 @@ def run(config: dict):
     # evaluation scores the RECIPE; the model you'd actually use is the same recipe (tuned, if tuning ran) refit on all development rows
     final_model = pipeline.fit(X_dev, y_dev)
     refit = f"Final model: {'tuned ' if tuning_enabled else ''}{model_type} refit on all {len(X_dev)} development rows."
-    report += "\n" + refit + "\n"
+    kept = kept_features(final_model)
+    kept_line = f"Features kept ({len(kept)}): {', '.join(kept)}"
+    summary["kept_features"] = kept
+    report += "\n" + refit + "\n" + kept_line + "\n"
 
     # week 7: the scoreboard -- one row per run, comparable with every run on the same data and folds
-    selection_cfg = config.get("feature_selection") or {}
     row = {"run": run_id, "data": data_cfg["path"], "model": model_type, "tuned": tuning_enabled,
            "encoder": prep_cfg["encoder"], "scaler": prep_cfg["scaler"],
            "features": "+".join(prep_cfg.get("engineered_features") or []) or "base",
-           "selection": bool(selection_cfg.get("enabled", False)),
+           "feature_selection": selection_method if selection_on else "off",
            "params": str(config["model"].get("params")), "tuned_params": str(study.best_params) if study else "",
            "metric": selection_metric, "mean": final_scores["validation"].mean(),
            "std": final_scores["validation"].std(ddof=1), "untuned": untuned, "floor": floor,
@@ -190,7 +210,7 @@ def run(config: dict):
     runs = save_scores(config.get("output", {}).get("scoreboard", "results/runs.csv"), row)
     same = runs[(runs["data"] == row["data"]) & (runs["metric"] == selection_metric)]
     board = (same.sort_values("mean", ascending=False)
-             [["run", "model", "tuned", "features", "selection", "mean", "std", "untuned", "floor"]]
+             [["run", "model", "tuned", "features", "feature_selection", "mean", "std", "untuned", "floor"]]
              .rename(columns={"mean": selection_metric})
              .to_string(index=False, float_format=lambda v: f"{v:.3f}"))
     print(f"\nScoreboard (runs on the same data and metric; best first)\n{board}")
@@ -198,6 +218,7 @@ def run(config: dict):
 
     path = save_run(config.get("output", {}).get("results_dir", "results"), run_id, config, report)
     print(f"\n{refit}\nFull report (per-fold tables, tuning, confusion matrix, fairness): {path}")
+    print(kept_line)
     summary["results_path"] = path
     return final_model, summary
 

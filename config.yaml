@@ -81,9 +81,13 @@ cv:                               # same random_state = same folds on every run,
 # The model main.py runs, with its DEFAULT hyperparameters. With tuning.enabled the search space below
 # overrides the tuned ones in every trial; the final model uses the best trial's values.
 model:
-  type: "gradient_boosting"       # dummy | logistic_regression | naive_bayes | decision_tree | random_forest | oblique_random_forest | adaboost | gradient_boosting | hist_gradient_boosting
+  type: "xgboost"                 # dummy | logistic_regression | naive_bayes | decision_tree | random_forest | oblique_random_forest | adaboost | gradient_boosting | hist_gradient_boosting | xgboost
   params:
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 4
     random_state: 42
+    n_jobs: 1
   # Other models' default params, to swap in (models keep n_jobs: 1 -- cv.n_jobs already parallelises the folds).
   # class_weight: balanced would weight each class by 1 / its frequency (GradientBoosting and GaussianNB have none).
   # logistic_regression:    {max_iter: 2000}
@@ -92,6 +96,7 @@ model:
   # random_forest:          {n_estimators: 200, random_state: 42, n_jobs: 1}   # more trees never overfit: fixed, not tuned
   # oblique_random_forest:  {n_estimators: 200, n_components: 10, random_state: 42, n_jobs: 1}
   # adaboost:               {max_depth: 1, n_estimators: 200, learning_rate: 1.0, random_state: 42}
+  # gradient_boosting:      {random_state: 42}
   # hist_gradient_boosting: {random_state: 42}
 
 # Week 5: hyperparameter tuning with Optuna (src/tuning.py). Development set only; every trial is CV of the
@@ -137,15 +142,33 @@ tuning:
       model__max_leaf_nodes: {type: int, low: 2, high: 63, log: true}
       model__min_samples_leaf: {type: int, low: 5, high: 200, log: true}
       model__l2_regularization: {type: float, low: 0.000001, high: 10.0, log: true}
+    xgboost:                      # week 8: the same three together, plus the brakes inside every split
+      model__n_estimators: {type: int, low: 50, high: 600, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.3, log: true}
+      model__max_depth: {type: int, low: 1, high: 8}
+      model__min_child_weight: {type: float, low: 1.0, high: 50.0, log: true}
+      model__subsample: {type: float, low: 0.5, high: 1.0}
+      model__colsample_bytree: {type: float, low: 0.5, high: 1.0}
+      model__reg_lambda: {type: float, low: 0.01, high: 10.0, log: true}
+      model__reg_alpha: {type: float, low: 0.001, high: 10.0, log: true}
+      model__gamma: {type: float, low: 0.0, high: 5.0}
 
-# Week 7 (Part B): learned feature selection as a Pipeline step between "prep" and "model" (src/selection.py).
-# Three models vote (random forest, gradient boosting, L1 logistic regression); a feature is kept with >= min_votes.
+# Weeks 7-8: learned feature selection as a Pipeline step between "prep" and "model" (src/selection.py).
+# On since week 8: the 2 features it keeps score the same as all 10 (see README), and a smaller model is easier to explain.
 feature_selection:
-  enabled: false
-  min_votes: 2
+  enabled: true
+  method: "vote"                  # vote (three models vote) | kbest (ANOVA F-test filter) | from_model (random forest importances)
+  min_votes: 2                    # vote: 1 (keep almost all) .. 3 (keep only unanimous)
+  k: 6                            # kbest: how many features to keep
+  threshold: "mean"               # from_model: importance needed to stay
   random_state: 42
-  search_space:                   # added to the model's search space when tuning is on
-    select__min_votes: {type: int, low: 1, high: 3}
+  search_space:                   # per method; added to the model's search space when tuning is on
+    vote:
+      select__min_votes: {type: int, low: 1, high: 3}
+    kbest:
+      select__k: {type: int, low: 2, high: 10}
+    from_model:
+      select__threshold: {type: categorical, choices: ["0.5*mean", "mean", "median", "1.5*mean"]}
 
 output:
   results_dir: "results"          # each run's full report is saved here as run_<run id>.txt
