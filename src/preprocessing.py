@@ -45,6 +45,22 @@ def canonicalize_categories(df: pd.DataFrame, canonical_maps: dict, placeholder_
     return out
 
 
+def placeholders_to_missing(df: pd.DataFrame, placeholder_tokens: set) -> pd.DataFrame:
+    """
+    Week 9: placeholder tokens ("?", "-", "N/A", ...) become NaN in EVERY text column, not only in the columns with a
+    canonical map. Until week 8 only mapped columns were checked, which was enough for COMPAS but left Adult's "?"
+    in workclass / occupation / native_country as a category of its own. The value is compared stripped; anything that
+    isn't a placeholder is left exactly as it was.
+    """
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_numeric_dtype(out[col]):
+            continue
+        is_placeholder = out[col].notna() & out[col].astype(str).str.strip().isin(placeholder_tokens)
+        out.loc[is_placeholder, col] = np.nan
+    return out
+
+
 def apply_domain_rules(df: pd.DataFrame, domain_rules: dict) -> pd.DataFrame:
     """Values outside the valid [min, max] range of a column become NaN, so they get imputed like any other missing value."""
     out = df.copy()
@@ -88,6 +104,14 @@ def fix_age_cat(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# Week 9: dataset-specific repairs are switched on by name in the config (cleaning.derived_fixes), so a new dataset
+# never runs COMPAS's fixes by accident -- and a new dataset can register its own here.
+_DERIVED_FIXES = {
+    "recover_juv_fel_count": recover_juv_fel_count,
+    "fix_age_cat": fix_age_cat,
+}
+
+
 def clean_dataset(df: pd.DataFrame, cleaning: dict) -> pd.DataFrame:
     """
     Apply the EDA diagnosis (config.yaml -> preprocessing.cleaning). Target-agnostic and fit-free, so it is safe on the full dataset and on label-free inference data.
@@ -95,20 +119,23 @@ def clean_dataset(df: pd.DataFrame, cleaning: dict) -> pd.DataFrame:
     Row-preserving (week 4): every input row comes out, in the same order. Removing duplicates is a training-only decision and lives in `drop_duplicate_rows()` -- at prediction time every row needs a prediction.
     """
     out = df.copy()
-    placeholder_tokens = set(cleaning["placeholder_tokens"])
+    placeholder_tokens = set(cleaning.get("placeholder_tokens") or [])
 
     # numeric columns that loaded as text because of placeholder tokens like "-"
-    for col in cleaning["numeric_as_text"]:
+    for col in cleaning.get("numeric_as_text") or []:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col].replace(list(placeholder_tokens), np.nan), errors="coerce")
 
-    out = apply_domain_rules(out, cleaning["domain_rules"])
-    out = canonicalize_categories(out, cleaning["canonical_maps"], placeholder_tokens)
-    out = recover_juv_fel_count(out)
-    out = fix_age_cat(out)
+    out = apply_domain_rules(out, cleaning.get("domain_rules") or {})
+    out = canonicalize_categories(out, cleaning.get("canonical_maps") or {}, placeholder_tokens)
+    out = placeholders_to_missing(out, placeholder_tokens)          # week 9: every text column, not only the mapped ones
+    for name in cleaning.get("derived_fixes") or []:
+        if name not in _DERIVED_FIXES:
+            raise ValueError(f"Unknown cleaning.derived_fixes entry: {name}. Options: {list(_DERIVED_FIXES)}")
+        out = _DERIVED_FIXES[name](out)
 
     # redundant columns (multicollinearity), dropped only after they've been used above
-    out = out.drop(columns=[c for c in cleaning["redundant_columns"] if c in out.columns])
+    out = out.drop(columns=[c for c in cleaning.get("redundant_columns") or [] if c in out.columns])
 
     return out
 
@@ -181,14 +208,16 @@ def add_missingness_indicators(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     return out
 
 
-def split_features_target(df: pd.DataFrame, target: str, sensitive_attr: str, drop_columns: list, imputation: dict):
+def split_features_target(df: pd.DataFrame, target: str, sensitive_attr: str, drop_columns: list, imputation: dict,
+                          audit_columns: list = None):
     """
     Returns (X, y, extras). On label-free inference data `y` is None -- nothing downstream requires the target.
-    `extras` holds the sensitive attribute and COMPAS's own score, kept for the fairness audit, never used as model inputs.
+    `extras` holds the sensitive attribute and any `audit_columns` (week 9: from the config -- COMPAS's own score for
+    COMPAS, nothing for Adult), kept for the fairness audit, never used as model inputs.
     """
     df = add_missingness_indicators(df, mnar_columns(imputation))
     y = df[target] if target in df.columns else None
-    extras = df[[c for c in [sensitive_attr, "score_text"] if c in df.columns]].copy()
+    extras = df[[c for c in [sensitive_attr, *(audit_columns or [])] if c in df.columns]].copy()
     excluded = set([target, sensitive_attr] + drop_columns)
     X = df[[c for c in df.columns if c not in excluded]]
     return X, y, extras

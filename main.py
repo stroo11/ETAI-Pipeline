@@ -2,7 +2,8 @@
 Entry point for the predictive pipeline.
 
 Run with:
-    python main.py
+    python main.py                       # COMPAS (config.yaml)
+    python main.py config_adult.yaml     # week 9: any other config, e.g. the Adult income data
 
 This orchestrates the full pipeline:
     load config -> load data -> clean (row-preserving) -> drop duplicates (training data only) -> [week 6] engineered features
@@ -10,9 +11,12 @@ This orchestrates the full pipeline:
     -> [week 5, if tuning.enabled] nested CV of the tuning procedure, then tune on all development rows
     -> refit the final (tuned) model on all development rows -> save the report and [week 7] add the run to the scoreboard
 
+[week 9] If the config has a `predict` section, the final model also predicts a new, unlabelled file (src/predict.py).
+
 [week 8] Preprocessing and feature selection are cached in a temporary folder for the length of the run, so tuning the model doesn't refit them in every trial.
 """
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 
@@ -39,12 +43,19 @@ from src.evaluate import (
 )
 from src.tuning import nested_cross_validate, tune_pipeline, tuning_report
 from src.results import save_run, save_scores
+from src.predict import predict_new_data
 from src.selection import kept_features
 
 
 def load_config(path: str = "config.yaml") -> dict:
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def fairness_settings(config: dict) -> dict:
+    """Week 9: what the fairness audit compares against and how it words the groups (config.yaml -> fairness)."""
+    fairness = config.get("fairness") or {}
+    return {key: fairness[key] for key in ["reference", "negative_label", "positive_label"] if key in fairness}
 
 
 def load_development_set(config: dict):
@@ -62,6 +73,7 @@ def load_development_set(config: dict):
         sensitive_attr=data_cfg["sensitive_attr"],
         drop_columns=data_cfg["drop_columns"],
         imputation=prep_cfg["imputation"],
+        audit_columns=data_cfg.get("audit_columns"),
     )
     # the locked test set is carved out here and never used again
     X_dev, _X_test, y_dev, _y_test, extras_dev, _extras_test = split_dev_test(
@@ -112,7 +124,8 @@ def _run(config: dict, cache_dir: str):
         pipeline.fit(X_tr, y_tr)
         report = holdout_report(y_tr, pipeline.predict(X_tr), y_va, pipeline.predict(X_va))
         report += "\n" + fairness_report(y_va, pipeline.predict_proba(X_va)[:, 1], extras_va,
-                                         sensitive_attr=data_cfg["sensitive_attr"], rows_label="validation rows")
+                                         sensitive_attr=data_cfg["sensitive_attr"], rows_label="validation rows",
+                                         **fairness_settings(config))
         print(report)
         path = save_run(config.get("output", {}).get("results_dir", "results"), run_id, config, report)
         print(f"Full results saved to {path}")
@@ -188,7 +201,8 @@ def _run(config: dict, cache_dir: str):
         print(f"  {name:<18s} {final_scores[name].mean():.3f} ± {final_scores[name].std(ddof=1):.3f}")
     summary["oof_proba"] = oof_proba
     report += "\n\n" + oof_classification_report(y_dev, oof_proba)
-    report += "\n" + fairness_report(y_dev, oof_proba, extras_dev, sensitive_attr=data_cfg["sensitive_attr"])
+    report += "\n" + fairness_report(y_dev, oof_proba, extras_dev, sensitive_attr=data_cfg["sensitive_attr"],
+                                     **fairness_settings(config))
 
     # evaluation scores the RECIPE; the model you'd actually use is the same recipe (tuned, if tuning ran) refit on all development rows
     final_model = pipeline.fit(X_dev, y_dev)
@@ -218,13 +232,18 @@ def _run(config: dict, cache_dir: str):
 
     path = save_run(config.get("output", {}).get("results_dir", "results"), run_id, config, report)
     print(f"\n{refit}\nFull report (per-fold tables, tuning, confusion matrix, fairness): {path}")
+    predictions_path = predict_new_data(config, final_model)        # week 9: only when the config has `predict`
+    if predictions_path:
+        print(f"Predictions for {config['predict']['path']}: {predictions_path}")
+        summary["predictions_path"] = predictions_path
     print(kept_line)
     summary["results_path"] = path
     return final_model, summary
 
 
 def main():
-    final_model, _ = run(load_config())
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    final_model, _ = run(load_config(config_path))
     return final_model
 
 

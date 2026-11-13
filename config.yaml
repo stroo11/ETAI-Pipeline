@@ -7,6 +7,13 @@ data:
   sensitive_attr: "race"          # excluded from model features, used only to audit fairness
   drop_columns: ["id", "decile_score", "score_text"]  # identifiers / COMPAS's own score, not our model's inputs
   id_column: "id"                 # week 4: repeated ids are dropped from the TRAINING data only (drop_duplicate_rows)
+  audit_columns: ["score_text"]   # week 9: kept next to the sensitive attribute for the fairness audit, never a feature
+
+# Week 9: the fairness audit compares the model with COMPAS's own score ("Low" = not flagged) on the same rows.
+fairness:
+  reference: {name: "COMPAS's own score", column: "score_text", negative_values: ["Low"]}
+  negative_label: "did NOT reoffend"
+  positive_label: "were predicted to"
 
 preprocessing:
   # --- stage 1: deterministic cleanup (the EDA diagnosis), safe before the split
@@ -30,6 +37,8 @@ preprocessing:
         native american: "Native American"
       c_charge_degree: {f: "F", felony: "F", m: "M", misdemeanor: "M"}
       score_text: {low: "Low", medium: "Medium", high: "High"}
+    # week 9: COMPAS-only repairs, switched on by name (src/preprocessing.py:_DERIVED_FIXES)
+    derived_fixes: ["recover_juv_fel_count", "fix_age_cat"]
     redundant_columns: ["prior_offenses", "age_in_months", "juvenile_total"]  # multicollinearity
 
   # --- stage 2: learned steps, fit on the training rows only

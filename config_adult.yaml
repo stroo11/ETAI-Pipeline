@@ -1,0 +1,142 @@
+# Week 9 -- the same pipeline on a different dataset: Adult income (1994 US Census, UCI), subsampled and extended
+# for the course. Run with:   python main.py config_adult.yaml
+# Every Adult-specific decision lives here; src/ names no Adult column. Data card: data/ADULT_README.md.
+
+data:
+  path: "data/adult_train.csv"
+  target: "income_over_50k"       # 1 = earns more than 50K a year (about 24% of people)
+  sensitive_attr: "sex"           # audited for fairness, never a feature
+  # id: identifier. fnlwgt: a census SAMPLING WEIGHT (how many people the row represents), not a trait of the person.
+  # race: the second sensitive attribute. Only one can be audited, and I keep it out of the model too, so that no
+  # prediction depends on it directly. (relationship still carries sex indirectly: "Husband" / "Wife".)
+  drop_columns: ["id", "fnlwgt", "race"]
+  id_column: "id"                 # unique in both files; the predictions are saved by id
+  audit_columns: []               # no existing score to compare with (COMPAS had its own)
+
+fairness:
+  negative_label: "earn 50K or less"
+  positive_label: "were predicted to earn more"
+
+preprocessing:
+  cleaning:
+    placeholder_tokens: ["", "?", "N/A", "NA", "n/a", "na", "nan"]   # "?" = unknown in workclass / occupation / native_country
+    numeric_as_text: []
+    domain_rules:                 # no violations in these files; the rules protect future data
+      age: {min: 17, max: 90}     # 17-year-olds are valid here (74 people): COMPAS's min 18 would erase them
+      hours_per_week: {min: 1, max: 99}
+      capital_gain: {min: 0}      # 99999 is the census top code ("99999 or more"), a real value: no max
+      capital_loss: {min: 0}
+    canonical_maps: {}            # spellings are already consistent
+    derived_fixes: []             # COMPAS's repairs don't apply
+    redundant_columns: ["education"]   # one to one with education_num, which keeps the order
+
+  imputation:                     # MCAR -> simple fill; MNAR -> fill AND add a <col>_was_missing flag
+    # the 379 unknown workclass are exactly the unknown occupation (+2 who never worked), and they earn > 50K half as
+    # often (12% vs 25%): the gap carries information. One flag covers both columns.
+    workclass: {mechanism: MNAR, strategy: most_frequent, indicator: true}
+    occupation: {mechanism: MNAR, strategy: most_frequent, indicator: false}
+    native_country: {mechanism: MCAR, strategy: most_frequent, indicator: false}   # 23% vs 24%: no pattern
+    v01: {mechanism: MCAR, strategy: median, indicator: false}
+    v02: {mechanism: MCAR, strategy: median, indicator: false}
+    v03: {mechanism: MCAR, strategy: median, indicator: false}
+    v04: {mechanism: MCAR, strategy: median, indicator: false}
+    v05: {mechanism: MCAR, strategy: median, indicator: false}
+    v06: {mechanism: MCAR, strategy: median, indicator: false}
+  # Every column the model may use must be listed here: an unlisted column is silently left out.
+  # v01-v25 are undocumented: kept as features, and feature selection decides.
+  numeric_features: ["age", "education_num", "capital_gain", "capital_loss", "hours_per_week",
+                     "v01", "v02", "v03", "v04", "v05", "v06", "v07", "v08", "v09", "v10",
+                     "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"]
+  categorical_features: ["workclass", "marital_status", "occupation", "relationship", "native_country",
+                         "v19", "v20", "v21", "v22", "v23", "v24", "v25"]
+  encoder: "target"               # native_country has 41 values, many with < 5 people: one-hot would add ~40 sparse columns
+  scaler: "minmax"
+  numeric_imputer: "median"
+  knn_neighbors: 5
+  log_features: []
+  engineered_features: []
+  random_state: 42
+
+test_set:                         # locked: never used to fit, tune, compare or choose anything
+  size: 0.2
+  random_state: 42
+
+evaluation:
+  method: "cv"
+  validation_size: 0.25
+  random_state: 42
+
+cv:
+  n_splits: 5
+  shuffle: true
+  random_state: 42
+  metrics: ["accuracy", "balanced_accuracy", "precision", "recall", "f1", "fbeta_2", "roc_auc", "average_precision"]
+  selection_metric: "roc_auc"
+  n_jobs: -1
+
+model:
+  type: "xgboost"
+  params:
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 4
+    random_state: 42
+    n_jobs: 1
+
+tuning:
+  enabled: true
+  n_trials: 30
+  n_splits: 5
+  random_state: 42
+  search_spaces:
+    logistic_regression:
+      model__C: {type: float, low: 0.0001, high: 100, log: true}
+    decision_tree:
+      model__max_depth: {type: int, low: 1, high: 20}
+      model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
+      model__criterion: {type: categorical, choices: ["gini", "entropy"]}
+    random_forest:
+      model__max_depth: {type: int, low: 2, high: 30}
+      model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
+      model__max_features: {type: categorical, choices: ["sqrt", 0.5, 1.0]}
+    hist_gradient_boosting:
+      model__max_iter: {type: int, low: 25, high: 500, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.5, log: true}
+      model__max_leaf_nodes: {type: int, low: 2, high: 63, log: true}
+      model__min_samples_leaf: {type: int, low: 5, high: 200, log: true}
+      model__l2_regularization: {type: float, low: 0.000001, high: 10.0, log: true}
+    xgboost:
+      model__n_estimators: {type: int, low: 50, high: 600, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.3, log: true}
+      model__max_depth: {type: int, low: 1, high: 8}
+      model__min_child_weight: {type: float, low: 1.0, high: 50.0, log: true}
+      model__subsample: {type: float, low: 0.5, high: 1.0}
+      model__colsample_bytree: {type: float, low: 0.5, high: 1.0}
+      model__reg_lambda: {type: float, low: 0.01, high: 10.0, log: true}
+      model__reg_alpha: {type: float, low: 0.001, high: 10.0, log: true}
+      model__gamma: {type: float, low: 0.0, high: 5.0}
+
+feature_selection:
+  enabled: true
+  method: "vote"
+  min_votes: 2
+  k: 15
+  threshold: "mean"
+  random_state: 42
+  search_space:
+    vote:
+      select__min_votes: {type: int, low: 1, high: 3}
+    kbest:
+      select__k: {type: int, low: 5, high: 40}
+    from_model:
+      select__threshold: {type: categorical, choices: ["0.5*mean", "mean", "median", "1.5*mean"]}
+
+output:
+  results_dir: "results/adult"    # its own folder: the scoreboard never mixes Adult and COMPAS runs
+  scoreboard: "results/adult/runs.csv"
+
+# Week 9: after the final refit, predict the 2,000 new people (no target). Rows out = rows in.
+predict:
+  path: "data/adult_new.csv"
+  output: "predictions/adult_new_predictions.csv"
+  threshold: 0.5

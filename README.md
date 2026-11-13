@@ -15,6 +15,7 @@ Run it with `python main.py`. Everything tunable lives in `config.yaml`.
 | 6 | Ensembles: oblique random forest and AdaBoost (`oblique_random_forest()`, `adaboost()`); random forest with fixed 200 trees; engineered features (`add_engineered_features()`, off by default) | nested CV (accuracy), same folds | Tuned AdaBoost, **0.684 ± 0.014** (nested CV), tied with both forests |
 | 7 | Gradient boosting, HistGradientBoosting and Naive Bayes; 8 metrics from out-of-fold probabilities, ROC-AUC as the selection metric; the scoreboard (`results/runs.csv`); optional learned feature selection (`VoteSelector`) | nested CV, **ROC-AUC**, same folds | Tuned HistGradientBoosting / gradient boosting, **0.728 ± 0.016** ROC-AUC (nested CV), tied with AdaBoost and the oblique forest |
 | 8 | XGBoost; feature selection as a Pipeline step, on by default (`vote`, `kbest`, `from_model`); cached preprocessing and selection | nested CV, ROC-AUC, same folds | Tuned XGBoost + `vote` selection, **0.726 ± 0.013** ROC-AUC (nested CV) on 2 features, tied with the larger boosters (0.728) |
+| 9 | Option A, beyond COMPAS: the same pipeline on the Adult income data (`config_adult.yaml`); cleaning, fairness and the run made general; predictions for new data (`src/predict.py`) | nested CV, ROC-AUC, on Adult's own development set | Adult: tuned XGBoost + `vote` selection, **0.910 ± 0.014** ROC-AUC, 0.857 accuracy, 0.668 F1 (all three targets met). COMPAS unchanged |
 
 ## Week 2 -- Baseline
 
@@ -249,3 +250,59 @@ Tuned XGBoost (30 Optuna trials, 5 inner folds), ROC-AUC, nested CV, the same 5 
 **What I found in the voters.** Three votes are almost never reached in this pipeline, because the L1 logistic regression hardly votes. With `C=0.01` on our min-max-scaled columns, it shrinks every coefficient to zero on 4 of the 5 folds. With the course's robust scaler, the same L1 model keeps exactly `age` and `priors_count` on all 5 folds. So `min_votes=3` only works here through the guard I added (keep the most-voted features), and it is really a two-voter system. The kept features would be the same under either scaler, so I left the scaler alone. Still, the fixed `C` makes this voter depend on the scale of the data, and that is worth remembering if the scaler changes.
 
 **Current best model:** tuned XGBoost with `vote` selection, the model in `config.yaml`: **0.726 ± 0.013** ROC-AUC (nested CV) on `age` and `priors_count`. It is statistically tied with the larger boosters (0.728 at best), and it is the one I would use because it is the simplest. If only the highest mean mattered, I would report `from_model` or HistGradientBoosting at 0.728, but those leads are noise.
+
+## Beyond COMPAS (week 9, option A: Adult income)
+
+**The question:** does a person earn more than 50,000 USD a year? The data is the 1994 US Census (UCI *Adult*), subsampled and extended for the course. `data/adult_train.csv` has 6,000 labelled people (24% earn more than 50K). `data/adult_new.csv` has 2,000 people without a label. Column descriptions are in `data/ADULT_README.md`.
+
+**How to run it:**
+
+```bash
+python main.py                      # COMPAS, exactly as before (config.yaml)
+python main.py config_adult.yaml    # Adult income
+```
+
+The Adult run writes its reports and scoreboard to `results/adult/`, so they never mix with COMPAS's. It also writes the predictions for the new people to **`predictions/adult_new_predictions.csv`** (`id`, `probability`, `prediction`; 2,000 rows in, 2,000 out). `wk09/run_adult.py` reruns every comparison below.
+
+**Decisions in `config_adult.yaml`.** I audit `sex` (the `data.sensitive_attr`). I keep `race`, the second sensitive attribute, out of the features too, so that no prediction depends on it directly, although `relationship` ("Husband" / "Wife") still carries sex indirectly. `fnlwgt` is dropped: it is a census sampling weight, not a trait of the person. `education` is dropped as redundant with `education_num`, which keeps the order. The `?` placeholders become missing values. The unknown `workclass` and `occupation` are the same people, and they earn more than 50K half as often, so one `workclass_was_missing` flag records that. `native_country` and `v01`–`v06` are imputed without a flag. The validity rules are Adult's own (age 17–90). `capital_gain`'s 99999 is the census top code, a real value, so it is kept. Target encoding handles `native_country`'s 41 mostly rare values. The 25 undocumented columns `v01`–`v25` are all listed as features, and feature selection decides about them.
+
+### What broke, why, and how I fixed it
+
+Each fix is general and driven by the config, so `src/` names no Adult column. After all the fixes, the COMPAS report (`python main.py`, tuning off) is **identical, character for character**, to the one from before today.
+
+| # | What broke | Why | Fix |
+|---|---|---|---|
+| 1 | `main.py` could only run COMPAS | `load_config()` always read `config.yaml` | the config is an optional argument: `python main.py config_adult.yaml` (default `config.yaml`) |
+| 2 | Adult's `?` stayed as a category of its own (379 in `workclass`, 381 in `occupation`, 86 in `native_country`). **No error**, just a wrong category | placeholders were only turned into missing values in the columns that had a `canonical_maps` entry, and on COMPAS every placeholder happened to be in such a column | new `placeholders_to_missing()`: placeholders become missing in **every** text column. Checked: 379 / 381 / 86 missing, no `?` left, in both files |
+| 3 | COMPAS's validity rule would have erased 74 valid people | `age: {min: 18}` is COMPAS's rule (adult defendants); Adult has 17-year-olds | each dataset's rules live in its own config (`age: 17–90`, hours 1–99, gains ≥ 0) |
+| 4 | `clean_dataset()` crashed on a config without every COMPAS key | it read `cleaning["numeric_as_text"]` etc. with `[]` | every cleaning setting is optional (empty by default) |
+| 5 | COMPAS's own repairs ran on every dataset | `recover_juv_fel_count()` and `fix_age_cat()` were always called and only skipped because Adult lacks those columns | they run only when named in `cleaning.derived_fixes` (the COMPAS config lists both) |
+| 6 | The fairness report crashed (`KeyError: 'score_text'`) | it always compared with COMPAS's score, and its wording ("did NOT reoffend") was COMPAS's | a `fairness` section in the config: an optional `reference` score and the wording. Adult has no reference, so only the model is audited |
+| 7 | `score_text` was always kept for the audit | `split_features_target()` named it in the code | `data.audit_columns` in the config |
+| 8 | The final model could not predict new people | the pipeline only evaluated and refit | new `src/predict.py`: same cleaning, engineered features and feature split, **no** `drop_duplicate_rows()`. It writes `id`, probability and 0/1 prediction, and fails loudly if rows out ≠ rows in |
+| 9 | The scoreboard would have mixed both datasets | one `results/` folder | each config has its own `output` folder (`results/adult/`) |
+
+I found most of these by reading `src/` for COMPAS column names and hard-coded steps, then confirmed the silent ones on Adult's data before fixing them: #2 (the 379 `?` were still there) and #3 (74 ages became missing). I also checked the course's warning that an unlisted column is silently left out: every Adult column reaches the model, and the "features kept" line ends every run.
+
+### Results (Adult, development set: 4,800 people; test set locked)
+
+ROC-AUC is the selection metric. Every tuned run uses 30 Optuna trials and nested CV, on the same 5 outer folds. Accuracy and F1 (class 1, threshold 0.5) are the nested out-of-fold means. Targets: ROC-AUC ≥ 0.90, accuracy ≥ 0.855, F1 ≥ 0.66, all in the same run.
+
+| Run | ROC-AUC | Accuracy | F1 | Features kept | Targets |
+|---|---|---|---|---|---|
+| No model (dummy) | 0.500 | 0.761 | 0.000 | — | — |
+| Decision tree, default | 0.726 ± 0.015 | 0.801 | 0.583 | 36 | no |
+| Logistic regression, tuned | 0.893 ± 0.013 | 0.844 | 0.637 | 36 | no |
+| HistGradientBoosting, tuned | 0.906 ± 0.013 | 0.861 | 0.666 | 36 | yes |
+| XGBoost, tuned, no selection | 0.907 ± 0.016 | 0.862 | 0.669 | 36 | yes |
+| **XGBoost, tuned + `vote` selection** (`config_adult.yaml`) | **0.910 ± 0.014** | **0.857** | **0.668** | **8** | **yes** |
+| XGBoost, tuned + `kbest` | 0.909 ± 0.015 | 0.859 | 0.671 | 9 | yes |
+| XGBoost, tuned + `from_model` | 0.911 ± 0.016 | 0.863 | 0.677 | 9 | yes |
+
+**Corrected paired tests (ROC-AUC, same folds).** Selection helps here, unlike on COMPAS. `vote` beats no selection by +0.003 in **5 of 5 folds** (p = 0.06), `kbest` by +0.003 in 5 of 5 (p = 0.03), and `from_model` by +0.004 in 5 of 5 (p = 0.10). The three selectors tie with each other (`from_model` vs `vote`: +0.001, p = 0.68). XGBoost and HistGradientBoosting tie (+0.001, p = 0.80). Both clearly beat logistic regression (XGBoost +0.013, 5 of 5 folds, p = 0.002).
+
+**Features kept by the final model (`vote`):** `age`, `education_num`, `capital_gain`, `capital_loss`, `hours_per_week`, `marital_status`, `occupation`, `relationship`. **None of the 25 `v` columns survives** in any of the three selectors' final models (`kbest` and `from_model` keep these 8 plus `workclass`). The undocumented columns carried no signal the voters could find. They were 25 of 36 inputs, so dropping them is also what makes selection pay off here: on COMPAS there was no noise to remove. `native_country` is dropped as well. The tuner chose `min_votes=1` in all five outer folds, so on this data keeping everything with at least one vote is enough to get rid of the noise. (The L1 voter still hardly votes with our min-max scaler, as in week 8.)
+
+**Fairness (`sex`, nested out-of-fold, threshold 0.5).** Of the people who earn 50K or less, the final model wrongly predicts more for 2.4% of women and 8.8% of men. The model flags men far more often, which mirrors the data, where men earn more than 50K much more often. A gap in false positive rates is still a gap, and with `relationship` and `marital_status` in the model, sex enters indirectly even though it is not a feature.
+
+**What was hardest, and what got the targets.** The hardest assumption to find was the placeholder rule (#2). It raised no error: the pipeline ran and scored well with a fake `"?"` category, because on COMPAS every placeholder had sat in a mapped column by coincidence. Only looking at `value_counts()` after cleaning exposed it. The silent ones are the dangerous ones: wrong categories, an unlisted column, a validity rule that erases valid rows. The targets came from three things together. First, correct cleaning: real missing values, a flag for the informative ones, valid ages kept. Second, a tuned booster: the default tree reaches only 0.726 ROC-AUC, and logistic regression falls short at 0.893 / 0.844 / 0.637. Third, feature selection removing the 25 noise columns, which added a small but consistent gain. The final run passes all three targets, with accuracy closest to its line (0.857 ± 0.014 against 0.855). `from_model` gives more margin (0.863), but it ties with `vote` on the selection metric, so I kept the same selector as COMPAS. The final model is refit on the 4,800 development rows only: the locked test set stays untouched, as it is for COMPAS.

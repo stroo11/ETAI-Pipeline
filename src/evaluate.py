@@ -138,25 +138,33 @@ def corrected_paired_test(scores_a, scores_b, test_train_ratio: float) -> dict:
 # ------------------------------------------------------------------- fairness
 
 def fairness_report(y_true, oof_proba, extras: pd.DataFrame, sensitive_attr: str = "race",
-                    threshold: float = 0.5, rows_label: str = "development set, out-of-fold") -> str:
+                    threshold: float = 0.5, rows_label: str = "development set, out-of-fold",
+                    reference: dict = None, negative_label: str = "did NOT reoffend",
+                    positive_label: str = "were predicted to") -> str:
     """
-    False positive rate (share of people who did not reoffend but were predicted to) per
-    group of `sensitive_attr`, for the model's predictions (probability >= `threshold`) and for
-    COMPAS's own score (`score_text` other than "Low" counts as predicted to reoffend), on the
-    same rows. Rows with an unknown group are reported as "unknown". A simple check, not a full audit.
+    False positive rate (share of the true negatives that were predicted positive) per group of
+    `sensitive_attr`, for the model's predictions (probability >= `threshold`) and, if `reference`
+    is given (config.yaml -> fairness.reference), for an existing score on the same rows: a row
+    counts as predicted positive when `reference["column"]` is not in `reference["negative_values"]`
+    (COMPAS: `score_text` other than "Low"). Week 9: the reference and the wording come from the
+    config, so a dataset without COMPAS's score still gets the audit. Rows with an unknown group are
+    reported as "unknown". A simple check, not a full audit.
     """
     df = extras.copy()
     df[sensitive_attr] = df[sensitive_attr].astype(object).fillna("unknown")
     df["y_true"] = pd.Series(y_true).values
     df["y_pred_model"] = (np.asarray(oof_proba) >= threshold).astype(int)
-    df["y_pred_compas"] = (df["score_text"] != "Low").astype(int)
+    columns = [("Our model", "y_pred_model")]
+    if reference:
+        df["y_pred_reference"] = (~df[reference["column"]].isin(reference["negative_values"])).astype(int)
+        columns.append((reference["name"], "y_pred_reference"))
 
     lines = [
         f"False positive rate by {sensitive_attr} ({rows_label})",
-        "(share of people who did NOT reoffend, but were predicted to)",
+        f"(share of people who {negative_label}, but {positive_label})",
         "",
     ]
-    for label, col in [("Our model", "y_pred_model"), ("COMPAS's own score", "y_pred_compas")]:
+    for label, col in columns:
         lines.append(f"  {label}:")
         for group, g in df.groupby(sensitive_attr):
             negatives = g[g["y_true"] == 0]
