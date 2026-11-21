@@ -10,3 +10,6 @@ wk06/challenge_results.json
 wk07/scoreboard_results.json
 w08/challenge_results.json
 wk09/adult_results.json
+models/
+predictions.csv
+wk10/imputer_results.json

@@ -11,15 +11,19 @@ This orchestrates the full pipeline:
     -> [week 5, if tuning.enabled] nested CV of the tuning procedure, then tune on all development rows
     -> refit the final (tuned) model on all development rows -> save the report and [week 7] add the run to the scoreboard
 
+[week 10] The final fitted pipeline is saved (output.model_path); `python predict.py <csv>` predicts new data with it.
+
 [week 9] If the config has a `predict` section, the final model also predicts a new, unlabelled file (src/predict.py).
 
 [week 8] Preprocessing and feature selection are cached in a temporary folder for the length of the run, so tuning the model doesn't refit them in every trial.
 """
+import os
 import shutil
 import sys
 import tempfile
 from datetime import datetime
 
+import joblib
 import yaml
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
@@ -43,7 +47,7 @@ from src.evaluate import (
 )
 from src.tuning import nested_cross_validate, tune_pipeline, tuning_report
 from src.results import save_run, save_scores
-from src.predict import predict_new_data
+from src.predict import model_metadata, predict_new_data
 from src.selection import kept_features
 
 
@@ -140,7 +144,8 @@ def _run(config: dict, cache_dir: str):
         raise ValueError(f"cv.selection_metric '{selection_metric}' must be one of cv.metrics: {metrics}")
     scorers = build_scorers(metrics)
     n_jobs = cv_cfg.get("n_jobs", 1)
-    print(f"Model: {model_type}   |   selection metric: {selection_metric}   |   {cv_cfg['n_splits']}-fold CV")
+    print(f"Model: {model_type}   |   selection metric: {selection_metric}   |   {cv_cfg['n_splits']}-fold CV   |   "
+          f"imputer: {prep_cfg.get('numeric_imputer', 'median')}")
     print(f"Data:  {len(X_dev)} development rows (the locked test set is not used)")
 
     # week 7: the no-model floor (a dummy) on the same folds, so every run shows what the model adds
@@ -212,9 +217,17 @@ def _run(config: dict, cache_dir: str):
     summary["kept_features"] = kept
     report += "\n" + refit + "\n" + kept_line + "\n"
 
+    # week 10: keep the final fitted pipeline -- what predict.py loads to predict new data, with no training
+    model_path = config.get("output", {}).get("model_path")
+    if model_path:
+        os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
+        final_model.set_params(memory=None)           # the cache folder is deleted after the run; the model doesn't need it
+        joblib.dump({"pipeline": final_model, **model_metadata(config, X_dev)}, model_path)
+        summary["model_path"] = model_path
+
     # week 7: the scoreboard -- one row per run, comparable with every run on the same data and folds
     row = {"run": run_id, "data": data_cfg["path"], "model": model_type, "tuned": tuning_enabled,
-           "encoder": prep_cfg["encoder"], "scaler": prep_cfg["scaler"],
+           "encoder": prep_cfg["encoder"], "scaler": prep_cfg["scaler"], "imputer": prep_cfg.get("numeric_imputer", "median"),
            "features": "+".join(prep_cfg.get("engineered_features") or []) or "base",
            "feature_selection": selection_method if selection_on else "off",
            "params": str(config["model"].get("params")), "tuned_params": str(study.best_params) if study else "",
@@ -224,7 +237,7 @@ def _run(config: dict, cache_dir: str):
     runs = save_scores(config.get("output", {}).get("scoreboard", "results/runs.csv"), row)
     same = runs[(runs["data"] == row["data"]) & (runs["metric"] == selection_metric)]
     board = (same.sort_values("mean", ascending=False)
-             [["run", "model", "tuned", "features", "feature_selection", "mean", "std", "untuned", "floor"]]
+             [["run", "model", "tuned", "imputer", "features", "feature_selection", "mean", "std", "untuned", "floor"]]
              .rename(columns={"mean": selection_metric})
              .to_string(index=False, float_format=lambda v: f"{v:.3f}"))
     print(f"\nScoreboard (runs on the same data and metric; best first)\n{board}")
@@ -232,6 +245,8 @@ def _run(config: dict, cache_dir: str):
 
     path = save_run(config.get("output", {}).get("results_dir", "results"), run_id, config, report)
     print(f"\n{refit}\nFull report (per-fold tables, tuning, confusion matrix, fairness): {path}")
+    if model_path:
+        print(f"Saved model: {model_path}   (predict new data: python predict.py <input.csv> [output.csv])")
     predictions_path = predict_new_data(config, final_model)        # week 9: only when the config has `predict`
     if predictions_path:
         print(f"Predictions for {config['predict']['path']}: {predictions_path}")

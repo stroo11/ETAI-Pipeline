@@ -16,6 +16,7 @@ Run it with `python main.py`. Everything tunable lives in `config.yaml`.
 | 7 | Gradient boosting, HistGradientBoosting and Naive Bayes; 8 metrics from out-of-fold probabilities, ROC-AUC as the selection metric; the scoreboard (`results/runs.csv`); optional learned feature selection (`VoteSelector`) | nested CV, **ROC-AUC**, same folds | Tuned HistGradientBoosting / gradient boosting, **0.728 ± 0.016** ROC-AUC (nested CV), tied with AdaBoost and the oblique forest |
 | 8 | XGBoost; feature selection as a Pipeline step, on by default (`vote`, `kbest`, `from_model`); cached preprocessing and selection | nested CV, ROC-AUC, same folds | Tuned XGBoost + `vote` selection, **0.726 ± 0.013** ROC-AUC (nested CV) on 2 features, tied with the larger boosters (0.728) |
 | 9 | Option A, beyond COMPAS: the same pipeline on the Adult income data (`config_adult.yaml`); cleaning, fairness and the run made general; predictions for new data (`src/predict.py`) | nested CV, ROC-AUC, on Adult's own development set | Adult: tuned XGBoost + `vote` selection, **0.910 ± 0.014** ROC-AUC, 0.857 accuracy, 0.668 F1 (all three targets met). COMPAS unchanged |
+| 10 | The numeric imputer as a setting (median, mean, KNN, MICE, missForest; numeric columns scaled first); the final pipeline saved to `models/`; `predict.py` predicts a CSV from the terminal | nested CV, ROC-AUC, same folds | Unchanged: tuned XGBoost + `vote`, **0.726 ± 0.013** (COMPAS), **0.910 ± 0.014** (Adult). The imputer makes no detectable difference, so `median` stays |
 
 ## Week 2 -- Baseline
 
@@ -98,6 +99,17 @@ On fairness, the rate of people wrongly predicted to reoffend went down for ever
 - **Other selectors (Part B).** `feature_selection.method` chooses `vote`, `kbest` (ANOVA F-test filter) or `from_model` (random forest importances), each with its own entry under `feature_selection.search_space`.
 - `VoteSelector` lives in `src/selection.py` rather than `src/model.py`, with the course's `liblinear` L1 voter. It keeps my week 7 guard for when no feature reaches `min_votes`.
 - `w08/run_challenges.py` runs every scenario through `main.run()` (results in the git-ignored `w08/challenge_results.json`).
+
+## Week 10 -- Missing values and deployment
+
+**What was done:**
+
+- **The numeric imputer is a setting** (`preprocessing.numeric_imputer`). The options are `median`, `mean`, `knn`, `iterative` (MICE with one completed dataset) and `random_forest` (the missForest idea: `IterativeImputer` with a random forest per column). They are registered in `_NUMERIC_IMPUTERS` (`src/preprocessing.py`), like the scalers and encoders, and their options live in `preprocessing.imputer_settings` (`n_neighbors`, `max_iter`, `n_estimators`). All of them learn from the **feature** columns only, never from the target, so they run unchanged inside cross-validation and on new people. My config keeps its week 4 names (`numeric_imputer`) rather than the course's `imputation.numeric_strategy`, because `imputation` already holds my per-column missingness plan.
+- **The numeric columns are scaled first, then imputed**, for every imputer. KNN and the model-based imputers compare columns, so the columns must share one scale, and scikit-learn's scalers ignore gaps when they learn it. With `median` and the min-max scaler the order changes nothing: the COMPAS and Adult reports came out **identical, character for character**, to the ones from before today.
+- **The final pipeline is saved.** At the end of a run, `main.py` writes the refit pipeline to `output.model_path` (`models/model.joblib`, or `models/adult_model.joblib` for Adult) with `joblib`. It saves it together with the input columns it needs, the library versions and the run's config. The run's cache folder is detached first (`memory=None`).
+- **`predict.py`** (next to `main.py`) loads that file and predicts a CSV from the terminal, with no training. The functions it uses live in `src/predict.py` (`prepare_features()`, `predict()`), and `main.py` uses the same ones for Adult's predictions file, so there is one prediction path.
+- **A safer `predict.py` (B4):** it stops with a clear message when the input lacks a column the model needs, warns when a library version differs from the one the model was saved with, and refuses to write a file with fewer rows than it read. `tests/test_predict.py` checks that rows out = rows in (duplicates and gaps included), that a saved and reloaded model predicts the same, and that a missing column gives the clear error (`python tests/test_predict.py`).
+- `models/` and `predictions.csv` are git-ignored. `joblib` is in `requirements.txt`, and `data/compas_new_people.csv` (20 new people) is in `data/`. `wk10/run_imputers.py` reruns every comparison below.
 
 ## Model evaluation
 
@@ -250,6 +262,47 @@ Tuned XGBoost (30 Optuna trials, 5 inner folds), ROC-AUC, nested CV, the same 5 
 **What I found in the voters.** Three votes are almost never reached in this pipeline, because the L1 logistic regression hardly votes. With `C=0.01` on our min-max-scaled columns, it shrinks every coefficient to zero on 4 of the 5 folds. With the course's robust scaler, the same L1 model keeps exactly `age` and `priors_count` on all 5 folds. So `min_votes=3` only works here through the guard I added (keep the most-voted features), and it is really a two-voter system. The kept features would be the same under either scaler, so I left the scaler alone. Still, the fixed `C` makes this voter depend on the scale of the data, and that is worth remembering if the scaler changes.
 
 **Current best model:** tuned XGBoost with `vote` selection, the model in `config.yaml`: **0.726 ± 0.013** ROC-AUC (nested CV) on `age` and `priors_count`. It is statistically tied with the larger boosters (0.728 at best), and it is the one I would use because it is the simplest. If only the highest mean mattered, I would report `from_model` or HistGradientBoosting at 0.728, but those leads are noise.
+
+### Week 10 -- Missing values
+
+**Where the gaps are (COMPAS development set).** About 1 person in 7 (777 of 5,771, 13%) has at least one gap, mostly in `priors_count` (397), `c_charge_degree` (192) and `age` (120). Deleting those rows is not an option for a deployed model: a new person with a gap still needs a prediction. `priors_count` is the most often missing column and also the strongest predictor, so dropping it is not an option either. For `priors_count` and `c_charge_degree` the gap itself carries information, so they also keep their `_was_missing` flag. **No imputer uses the label**: filling a gap with the mean of the people with the same outcome would leak in cross-validation (the filled value *is* the label), and it cannot run at all on a new person, whose label is unknown.
+
+**A1 -- the imputers, on the same folds** (tuning off, ROC-AUC, corrected paired test against `median`):
+
+| Imputer | Configured model (XGBoost + `vote`) | vs `median` | Logistic regression (all features) | vs `median` | Run time (XGBoost) |
+|---|---|---|---|---|---|
+| **median** (kept) | **0.721 ± 0.013** | — | **0.717 ± 0.014** | — | fast |
+| mean | 0.720 ± 0.013 | −0.001 (1/5, p = 0.82) | 0.717 ± 0.013 | −0.000 (1/5, p = 0.53) | fast |
+| KNN (k = 5) | 0.720 ± 0.012 | −0.001 (2/5, p = 0.79) | 0.716 ± 0.013 | −0.002 (0/5, p = 0.17) | fast |
+| iterative (MICE) | 0.721 ± 0.014 | +0.000 (2/5, p = 0.85) | 0.718 ± 0.013 | +0.001 (5/5, p = 0.21) | fast |
+| random_forest (missForest) | 0.722 ± 0.013 | +0.001 (2/5, p = 0.65) | 0.718 ± 0.014 | +0.000 (3/5, p = 0.79) | ~45 s, the slowest by far |
+
+**I keep `median`.** No imputer is distinguishable from it: every difference is a thousandth or less, and every p-value is above 0.15. `median` is also the fastest, the simplest to explain, and the cheapest thing to carry inside a deployed model (one number per column). The reason is the one the course shows: a model-based imputer is only as good as the columns it can see, and our numeric imputer only sees five numeric columns that say little about each other. With `iterative`, `mean` and `random_forest` the vote selection keeps `age_cat` as a third feature, but the score doesn't move.
+
+**B2 -- letting the imputer see the categorical columns.** I hid 200 known values of `age` and of `priors_count` in fold 1's validation rows, fitted each imputer on the training rows, and measured the mean absolute error of its guesses. I did this once with the numeric columns only, and once with the categorical columns added as one-hot context (`ContextImputer` in `wk10/run_imputers.py`, which returns only the numeric columns).
+
+| Error of the guesses (MAE) | median | KNN | iterative | random_forest |
+|---|---|---|---|---|
+| `age`, numeric columns only | 9.2 years | 10.8 | 9.0 | 9.0 |
+| `age`, + categorical columns | 9.2 | **4.4** | **3.9** | **3.9** |
+| `priors_count`, numeric only | 3.1 priors | 3.2 | 3.3 | 3.1 |
+| `priors_count`, + categorical | 3.1 | 3.1 | 3.1 | 3.0 |
+
+Seeing `age_cat` **more than halves** the error on `age`, which is exactly the course's point. `priors_count` stays hard: nothing we have predicts it. The model barely notices, though: ROC-AUC 0.724 (KNN) and 0.724 (iterative) with the context, against 0.720 and 0.721 without it (+0.004, p = 0.20 and +0.002, p = 0.14). That is consistent in direction, but not a detectable gain. Better guesses for `age` don't help much because the model already has `age_cat`, and the gaps that matter, in `priors_count`, can't be guessed well by anything.
+
+**B1 -- multiple imputation (MICE in full).** I trained m = 5 pipelines with `IterativeImputer(sample_posterior=True, random_state=i)` in each fold and averaged their probabilities. The 5 completed datasets disagree about a missing `priors_count` by about ±3.8 priors on average: that spread is the uncertainty a single imputation hides. The average reaches 0.722 ± 0.013, against 0.721 for one iterative dataset and 0.721 for `median` (+0.001, p = 0.54). **It is not worth m times the cost here** (63 s against 10 s): the ensemble's gain is far below the fold-to-fold noise.
+
+**B3 -- random-forest proximities, from scratch.** I grew a forest (300 trees) on fold 1's training rows, using their labels. Each validation row with a hidden value is first filled with the training median and passed through the trees. Its proximity to each training row is the share of trees where the two land in the same leaf, and the gap becomes the proximity-weighted average of the training rows' values, repeated 3 times. For `age` the error falls from 6.4 to 4.3 years over the iterations (better than any numeric-only imputer, close to the imputers that see the categories). For `priors_count` it gets slightly worse (3.08 → 3.18), so there is no gain there either. **Could it run in `predict.py`?** Only partly. The forest uses only the *training* rows' labels, so a new person's label is never needed. But the model would have to carry the whole training set (its values and its leaves) to compute proximities, and every prediction would need several passes through the forest. The theory's "one copy per class" trick is needed when the forest is grown with the row's own label, which is how the method works on the training data, and that label is unknown for a new person. `IterativeImputer` with a random forest gets the same idea (forests learn the relationships) into a fitted, self-contained step.
+
+### Predicting new data
+
+```bash
+python main.py                                                     # train, evaluate, save models/model.joblib
+python predict.py data/compas_new_people.csv predictions.csv       # predict 20 new people
+python predict.py data/adult_new.csv out.csv --config config_adult.yaml   # same for Adult (models/adult_model.joblib)
+```
+
+The output CSV has **one row per input row**, in the same order: the `id`, the `probability` of the positive class, and the 0/1 `prediction` at 0.5. For `compas_new_people.csv` that is 20 rows in and 20 out (6 predicted to reoffend). The `"?"` in `priors_count` (row 3) and the missing age (row 7) are filled by the saved imputer. The never-seen charge degree `"X"` (row 11) is accepted by the encoder. The same person twice (rows 14–15) gets the same prediction, and both rows are kept. No training happens: the saved pipeline holds every learned value (medians, encodings, selected features, trees). For Adult, `predict.py` reproduces `predictions/adult_new_predictions.csv` exactly. A `.joblib` file can run code when loaded, so only load models you trust, and load them with the library versions they were saved with (`predict.py` warns when these differ).
 
 ## Beyond COMPAS (week 9, option A: Adult income)
 

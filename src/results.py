@@ -57,7 +57,7 @@ def save_run(results_dir: str, run: str, config: dict, report_text: str) -> str:
         f"Run: {run}   (written {datetime.now():%Y-%m-%d %H:%M:%S})\n"
         f"Model: {config['model']['type']}  params={config['model'].get('params')}\n"
         f"Preprocessing: encoder={prep['encoder']}  scaler={prep['scaler']}  "
-        f"numeric_imputer={prep.get('numeric_imputer', 'median')}  log_features={prep.get('log_features') or []}  "
+        f"numeric_imputer={prep.get('numeric_imputer', 'median')} {prep.get('imputer_settings') or {}}  log_features={prep.get('log_features') or []}  "
         f"engineered_features={prep.get('engineered_features') or []}\n"
         + selection_line +
         f"Evaluation: {method}  (development set only)\n"

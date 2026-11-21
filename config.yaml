@@ -53,8 +53,13 @@ preprocessing:
   categorical_features: ["sex", "age_cat", "c_charge_degree"]
   encoder: "target"               # onehot | ordinal | target
   scaler: "minmax"                # none | standard | minmax | robust
-  numeric_imputer: "median"       # week 4: median | mean | knn (knn scales first, then imputes from the nearest rows)
-  knn_neighbors: 5                # only used when numeric_imputer = knn
+  # Week 10: the numeric columns are scaled first, then imputed. median | mean | knn | iterative (MICE, one completed
+  # dataset) | random_forest (missForest). All learn from the features only, never from the target.
+  numeric_imputer: "median"
+  imputer_settings:
+    n_neighbors: 5                # knn
+    max_iter: 10                  # iterative, random_forest
+    n_estimators: 50              # random_forest (trees per column)
   log_features: []                # week 4: numeric columns to log1p before imputing/scaling, e.g. ["priors_count"]
   # Week 6: engineered columns (src/preprocessing.py:add_engineered_features), added to the numeric block.
   # Fixed formulas, nothing learned -> computed before the split. Options:
@@ -181,5 +186,6 @@ feature_selection:
 
 output:
   results_dir: "results"          # each run's full report is saved here as run_<run id>.txt
+  model_path: "models/model.joblib"   # week 10: the final fitted pipeline, used by predict.py (overwritten each run)
   scoreboard: "results/runs.csv"  # week 7: one row per run. Delete it when the data, cleaning or CV folds change --
                                   # rows are only comparable (paired by fold) on the same rows and folds

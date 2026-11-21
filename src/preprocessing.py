@@ -15,7 +15,9 @@ None of these functions require the target column, so the same code runs on unla
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401  (makes IterativeImputer importable)
+from sklearn.impute import IterativeImputer, KNNImputer, SimpleImputer
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -248,7 +250,20 @@ _ENCODERS = {
     "target": lambda seed: TargetEncoder(target_type="binary", cv=StratifiedKFold(5, shuffle=True, random_state=seed)),
 }
 
-_NUMERIC_IMPUTERS = ["median", "mean", "knn"]
+# Week 10: one entry per numeric_imputer, like _SCALERS and _ENCODERS; each gets imputer_settings and a seed.
+# "iterative" is MICE with one completed dataset; "random_forest" is the missForest idea (each column predicted from
+# the others by a random forest). All of them learn from the FEATURE columns only, never from the target, so they
+# run unchanged inside cross-validation and on new data to predict.
+_NUMERIC_IMPUTERS = {
+    "median": lambda cfg, seed: SimpleImputer(strategy="median"),
+    "mean": lambda cfg, seed: SimpleImputer(strategy="mean"),
+    "knn": lambda cfg, seed: KNNImputer(n_neighbors=cfg.get("n_neighbors", 5)),
+    "iterative": lambda cfg, seed: IterativeImputer(max_iter=cfg.get("max_iter", 10), random_state=seed),
+    "random_forest": lambda cfg, seed: IterativeImputer(
+        estimator=RandomForestRegressor(n_estimators=cfg.get("n_estimators", 50), min_samples_leaf=5,
+                                        random_state=seed, n_jobs=-1),
+        max_iter=cfg.get("max_iter", 10), random_state=seed),
+}
 
 
 def log1p_columns(X: pd.DataFrame, columns: list) -> pd.DataFrame:
@@ -261,12 +276,15 @@ def log1p_columns(X: pd.DataFrame, columns: list) -> pd.DataFrame:
 
 def build_numeric_pipeline(prep_config: dict) -> Pipeline:
     """
-    Numeric block: [optional log1p] -> impute -> scale, or [optional log1p] -> scale -> KNN impute.
-    KNNImputer (week 4) fills a gap from the k most similar training rows, and "similar" is a distance -- so the columns must be on comparable scales BEFORE it runs (a raw age of 18-96 would otherwise drown out every count). sklearn's scalers ignore NaN when fitting and keep it when transforming, which is what makes scale-then-impute possible.
+    Numeric block: [optional log1p] -> scale -> impute (week 10: always scale first).
+    KNN and the model-based imputers compare columns, so the columns must be on one scale BEFORE they run (a raw age of
+    18-96 would otherwise drown out every count). sklearn's scalers ignore NaN when fitting and keep it when
+    transforming, which is what makes scale-then-impute possible. For median / mean with a min-max scaler the order
+    changes nothing: the median of a scaled column is the scaled median.
     """
     strategy = prep_config.get("numeric_imputer", "median")
     if strategy not in _NUMERIC_IMPUTERS:
-        raise ValueError(f"Unknown numeric imputer: {strategy}. Options: {_NUMERIC_IMPUTERS}")
+        raise ValueError(f"Unknown numeric imputer: {strategy}. Options: {list(_NUMERIC_IMPUTERS)}")
     scaler = _SCALERS[prep_config["scaler"]]()
     log_features = prep_config.get("log_features") or []
 
@@ -274,10 +292,8 @@ def build_numeric_pipeline(prep_config: dict) -> Pipeline:
     if log_features:
         steps.append(("log1p", FunctionTransformer(log1p_columns, kw_args={"columns": log_features},
                                                    feature_names_out="one-to-one")))
-    if strategy == "knn":
-        steps += [("scale", scaler), ("impute", KNNImputer(n_neighbors=prep_config.get("knn_neighbors", 5)))]
-    else:
-        steps += [("impute", SimpleImputer(strategy=strategy)), ("scale", scaler)]
+    imputer = _NUMERIC_IMPUTERS[strategy](prep_config.get("imputer_settings") or {}, prep_config.get("random_state"))
+    steps += [("scale", scaler), ("impute", imputer)]
     return Pipeline(steps)
 
 

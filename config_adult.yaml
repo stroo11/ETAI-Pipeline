@@ -51,8 +51,8 @@ preprocessing:
                          "v19", "v20", "v21", "v22", "v23", "v24", "v25"]
   encoder: "target"               # native_country has 41 values, many with < 5 people: one-hot would add ~40 sparse columns
   scaler: "minmax"
-  numeric_imputer: "median"
-  knn_neighbors: 5
+  numeric_imputer: "median"       # median | mean | knn | iterative | random_forest (scaled first, then imputed)
+  imputer_settings: {n_neighbors: 5, max_iter: 10, n_estimators: 50}
   log_features: []
   engineered_features: []
   random_state: 42
@@ -134,6 +134,7 @@ feature_selection:
 output:
   results_dir: "results/adult"    # its own folder: the scoreboard never mixes Adult and COMPAS runs
   scoreboard: "results/adult/runs.csv"
+  model_path: "models/adult_model.joblib"   # week 10: used by `python predict.py <csv> <out> --config config_adult.yaml`
 
 # Week 9: after the final refit, predict the 2,000 new people (no target). Rows out = rows in.
 predict:
